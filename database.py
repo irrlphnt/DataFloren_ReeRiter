@@ -27,7 +27,7 @@ class Database:
     def _init_db(self) -> None:
         """Initialize the database tables."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
                 
                 # Create feeds table
@@ -49,14 +49,16 @@ class Database:
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS articles (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        feed_id INTEGER,
                         url TEXT UNIQUE NOT NULL,
                         title TEXT,
                         content TEXT,
                         author TEXT,
-                        published TEXT,
+                        published_date TEXT,
                         processed INTEGER DEFAULT 0,
-                        wordpress_post_id INTEGER,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                        wordpress_post_id TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (feed_id) REFERENCES feeds(id)
                     )
                 """)
                 
@@ -64,13 +66,10 @@ class Database:
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS processed_entries (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        feed_id INTEGER NOT NULL,
-                        entry_id TEXT UNIQUE NOT NULL,
-                        title TEXT,
-                        link TEXT,
-                        published_at TEXT,
+                        feed_id INTEGER,
+                        entry_url TEXT UNIQUE NOT NULL,
                         processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (feed_id) REFERENCES feeds (id)
+                        FOREIGN KEY (feed_id) REFERENCES feeds(id)
                     )
                 """)
                 
@@ -95,7 +94,8 @@ class Database:
                         usage_count INTEGER DEFAULT 0,
                         last_used TEXT,
                         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                        is_active INTEGER DEFAULT 1
+                        is_active INTEGER DEFAULT 1,
+                        thematic_prompt TEXT
                     )
                 """)
                 
@@ -115,9 +115,10 @@ class Database:
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS thematic_prompts (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        tag_name TEXT UNIQUE NOT NULL,
+                        tag_name TEXT NOT NULL,
                         prompt TEXT NOT NULL,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (tag_name) REFERENCES tags(name)
                     )
                 """)
                 
@@ -127,40 +128,40 @@ class Database:
             logger.error(f"Error initializing database: {e}")
             raise
     
-    def add_feed(self, url: str, name: str = None) -> bool:
+    def add_feed(self, url: str, name: str) -> Optional[int]:
         """
         Add a new feed to the database.
         
         Args:
             url (str): The feed URL
-            name (str, optional): A friendly name for the feed
+            name (str): The feed name
             
         Returns:
-            bool: True if successful, False otherwise
+            Optional[int]: The feed ID if successful, None otherwise
         """
-        conn = self._get_connection()
-        c = conn.cursor()
-        
         try:
-            # If no name provided, use the URL as the name
-            if not name:
-                name = url
-            
-            c.execute('''
-                INSERT INTO feeds (url, name)
-                VALUES (?, ?)
-            ''', (url, name))
-            
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            logging.warning(f"Feed URL {url} already exists")
-            return False
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # Check if feed already exists
+                c.execute('SELECT id FROM feeds WHERE url = ?', (url,))
+                existing = c.fetchone()
+                if existing:
+                    logging.warning(f"Feed URL {url} already exists")
+                    return existing[0]
+                
+                # Add new feed
+                c.execute('''
+                    INSERT INTO feeds (url, name, is_active)
+                    VALUES (?, ?, 1)
+                ''', (url, name))
+                
+                feed_id = c.lastrowid
+                conn.commit()
+                return feed_id
         except Exception as e:
             logging.error(f"Error adding feed {url}: {e}")
-            return False
-        finally:
-            conn.close()
+            return None
     
     def import_feeds_from_csv(self, csv_path: str) -> Dict[str, int]:
         """
@@ -341,29 +342,54 @@ class Database:
             logging.error(f"Error checking processed entry: {e}")
             return False
     
-    def update_feed_status(self, feed_id: int, is_active: bool) -> bool:
+    def update_feed_status(self, feed_id: int, is_active: bool = None, is_paywalled: bool = None) -> bool:
         """
-        Update the active status of a feed.
+        Update a feed's status.
         
         Args:
-            feed_id (int): The ID of the feed
-            is_active (bool): Whether the feed is active
+            feed_id (int): The feed ID
+            is_active (bool, optional): Whether the feed is active
+            is_paywalled (bool, optional): Whether the feed is paywalled
             
         Returns:
             bool: True if successful, False otherwise
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute(
-                "UPDATE feeds SET is_active = ? WHERE id = ?",
-                (is_active, feed_id)
-            )
-            conn.commit()
-            conn.close()
-            return c.rowcount > 0
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # Check if feed exists
+                c.execute('SELECT 1 FROM feeds WHERE id = ?', (feed_id,))
+                if not c.fetchone():
+                    logging.warning(f"Feed {feed_id} does not exist")
+                    return False
+                
+                updates = []
+                params = []
+                
+                if is_active is not None:
+                    updates.append('is_active = ?')
+                    params.append(1 if is_active else 0)
+                
+                if is_paywalled is not None:
+                    updates.append('is_paywalled = ?')
+                    params.append(1 if is_paywalled else 0)
+                
+                if not updates:
+                    return True
+                
+                params.append(feed_id)
+                query = f'''
+                    UPDATE feeds
+                    SET {', '.join(updates)}
+                    WHERE id = ?
+                '''
+                
+                c.execute(query, params)
+                conn.commit()
+                return True
         except Exception as e:
-            logging.error(f"Error updating feed status: {e}")
+            logging.error(f"Error updating feed status {feed_id}: {e}")
             return False
     
     def get_feed_stats(self) -> Dict[str, Any]:
@@ -500,27 +526,34 @@ class Database:
     
     def remove_feed(self, feed_id: int) -> bool:
         """
-        Remove a feed and its associated data.
+        Remove a feed from the database.
         
         Args:
-            feed_id (int): The ID of the feed
+            feed_id (int): The feed ID
             
         Returns:
             bool: True if successful, False otherwise
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
-            # Remove paywall hits
-            c.execute('DELETE FROM paywall_hits WHERE feed_id = ?', (feed_id,))
-            
-            # Remove the feed
-            c.execute('DELETE FROM feeds WHERE id = ?', (feed_id,))
-            
-            conn.commit()
-            conn.close()
-            return True
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # Check if feed exists
+                c.execute('SELECT 1 FROM feeds WHERE id = ?', (feed_id,))
+                if not c.fetchone():
+                    logging.warning(f"Feed {feed_id} does not exist")
+                    return False
+                
+                # First delete related records
+                c.execute('DELETE FROM articles WHERE feed_id = ?', (feed_id,))
+                c.execute('DELETE FROM processed_entries WHERE feed_id = ?', (feed_id,))
+                c.execute('DELETE FROM paywall_hits WHERE feed_id = ?', (feed_id,))
+                
+                # Then delete the feed
+                c.execute('DELETE FROM feeds WHERE id = ?', (feed_id,))
+                
+                conn.commit()
+                return True
         except Exception as e:
             logging.error(f"Error removing feed {feed_id}: {e}")
             return False
@@ -539,34 +572,33 @@ class Database:
         """
         try:
             normalized_name = self._normalize_tag(name)
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
-            # Check if tag already exists
-            c.execute('SELECT id FROM tags WHERE normalized_name = ?', (normalized_name,))
-            existing_tag = c.fetchone()
-            
-            if existing_tag:
-                # Update usage count and last used
-                c.execute('''
-                    UPDATE tags 
-                    SET usage_count = usage_count + 1,
-                        last_used = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                ''', (existing_tag[0],))
-                tag_id = existing_tag[0]
-            else:
-                # Insert new tag
-                c.execute('''
-                    INSERT INTO tags (name, normalized_name, thematic_prompt)
-                    VALUES (?, ?, ?)
-                ''', (name, normalized_name, thematic_prompt))
-                tag_id = c.lastrowid
-            
-            conn.commit()
-            conn.close()
-            return tag_id
-            
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # Check if tag already exists
+                c.execute('SELECT id FROM tags WHERE normalized_name = ?', (normalized_name,))
+                existing_tag = c.fetchone()
+                
+                if existing_tag:
+                    # Update usage count and last used
+                    c.execute('''
+                        UPDATE tags 
+                        SET usage_count = usage_count + 1,
+                            last_used = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (existing_tag[0],))
+                    tag_id = existing_tag[0]
+                else:
+                    # Insert new tag
+                    c.execute('''
+                        INSERT INTO tags (name, normalized_name, thematic_prompt)
+                        VALUES (?, ?, ?)
+                    ''', (name, normalized_name, thematic_prompt))
+                    tag_id = c.lastrowid
+                
+                conn.commit()
+                return tag_id
+                
         except Exception as e:
             logging.error(f"Error adding tag '{name}': {e}")
             return None
@@ -651,25 +683,24 @@ class Database:
             List[Dict[str, Any]]: List of thematic prompts with their associated tags
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
-            c.execute('''
-                SELECT id, name, thematic_prompt
-                FROM tags
-                WHERE thematic_prompt IS NOT NULL
-                AND is_active = 1
-            ''')
-            
-            prompts = [{
-                'id': row[0],
-                'tag_name': row[1],
-                'prompt': row[2]
-            } for row in c.fetchall()]
-            
-            conn.close()
-            return prompts
-            
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                c.execute('''
+                    SELECT id, name, thematic_prompt
+                    FROM tags
+                    WHERE thematic_prompt IS NOT NULL
+                    AND is_active = 1
+                ''')
+                
+                prompts = [{
+                    'id': row[0],
+                    'tag_name': row[1],
+                    'prompt': row[2]
+                } for row in c.fetchall()]
+                
+                return prompts
+                
         except Exception as e:
             logging.error(f"Error getting thematic prompts: {e}")
             return []
@@ -686,25 +717,24 @@ class Database:
             bool: True if successful, False otherwise
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
-            # First ensure the tag exists
-            tag_id = self.add_tag(tag_name)
-            if not tag_id:
-                return False
-            
-            # Update the thematic prompt
-            c.execute('''
-                UPDATE tags
-                SET thematic_prompt = ?
-                WHERE id = ?
-            ''', (prompt, tag_id))
-            
-            conn.commit()
-            conn.close()
-            return True
-            
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # First ensure the tag exists
+                tag_id = self.add_tag(tag_name)
+                if not tag_id:
+                    return False
+                
+                # Update the tag's thematic prompt
+                c.execute('''
+                    UPDATE tags
+                    SET thematic_prompt = ?
+                    WHERE id = ?
+                ''', (prompt, tag_id))
+                
+                conn.commit()
+                return True
+                
         except Exception as e:
             logging.error(f"Error adding thematic prompt for '{tag_name}': {e}")
             return False
@@ -759,33 +789,32 @@ class Database:
             bool: True if successful, False otherwise
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
-            # Get article ID
-            c.execute('SELECT id FROM articles WHERE url = ?', (article_url,))
-            result = c.fetchone()
-            if not result:
-                logger.error(f"Article not found: {article_url}")
-                return False
-            article_id = result[0]
-            
-            for tag_name in tag_names:
-                # Add or get tag
-                tag_id = self.add_tag(tag_name, source)
-                if not tag_id:
-                    continue
+            with self._get_connection() as conn:
+                c = conn.cursor()
                 
-                # Add article-tag relationship
-                c.execute('''
-                    INSERT OR IGNORE INTO article_tags (article_id, tag_id, source)
-                    VALUES (?, ?, ?)
-                ''', (article_id, tag_id, source))
-            
-            conn.commit()
-            conn.close()
-            return True
-            
+                # Get article ID
+                c.execute('SELECT id FROM articles WHERE url = ?', (article_url,))
+                result = c.fetchone()
+                if not result:
+                    logger.error(f"Article not found: {article_url}")
+                    return False
+                article_id = result[0]
+                
+                for tag_name in tag_names:
+                    # Add or get tag
+                    tag_id = self.add_tag(tag_name, source)
+                    if not tag_id:
+                        continue
+                    
+                    # Add article-tag relationship
+                    c.execute('''
+                        INSERT OR IGNORE INTO article_tags (article_id, tag_id, source)
+                        VALUES (?, ?, ?)
+                    ''', (article_id, tag_id, source))
+                
+                conn.commit()
+                return True
+                
         except Exception as e:
             logger.error(f"Error adding tags to article {article_url}: {e}")
             return False
@@ -801,33 +830,146 @@ class Database:
             bool: True if successful, False otherwise
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
-            # Extract article data
-            url = article_data.get('url')
-            title = article_data.get('title')
-            content = article_data.get('content')
-            author = article_data.get('author')
-            published = article_data.get('published')
-            processed = article_data.get('processed', 0)
-            wordpress_post_id = article_data.get('wordpress_post_id')
-            
-            # Save article
-            c.execute('''
-                INSERT OR REPLACE INTO articles 
-                (url, title, content, author, published, processed, wordpress_post_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (url, title, content, author, published, processed, wordpress_post_id))
-            
-            # Save tags if present
-            if 'tags' in article_data and article_data['tags']:
-                self.add_article_tags(url, article_data['tags'], source='rss')
-            
-            conn.commit()
-            conn.close()
-            return True
-            
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # Extract article data
+                url = article_data.get('url')
+                title = article_data.get('title')
+                content = article_data.get('content')
+                author = article_data.get('author')
+                published_date = article_data.get('published_date')
+                processed = article_data.get('processed', 0)
+                wordpress_post_id = article_data.get('wordpress_post_id')
+                feed_id = article_data.get('feed_id')
+                
+                # Save article
+                c.execute('''
+                    INSERT OR REPLACE INTO articles 
+                    (url, title, content, author, published_date, processed, wordpress_post_id, feed_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (url, title, content, author, published_date, processed, wordpress_post_id, feed_id))
+                
+                # Save tags if present
+                if 'tags' in article_data and article_data['tags']:
+                    self.add_article_tags(url, article_data['tags'], source='rss')
+                
+                conn.commit()
+                return True
+                
         except Exception as e:
             logger.error(f"Error saving article {article_data.get('url')}: {e}")
-            return False 
+            return False
+    
+    def get_feed(self, feed_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get a feed by its ID.
+        
+        Args:
+            feed_id (int): The feed ID
+            
+        Returns:
+            Optional[Dict[str, Any]]: The feed data if found, None otherwise
+        """
+        try:
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                c.execute('''
+                    SELECT id, url, name, is_active, is_paywalled, last_fetch, created_at
+                    FROM feeds
+                    WHERE id = ?
+                ''', (feed_id,))
+                
+                row = c.fetchone()
+                if row:
+                    return {
+                        'id': row[0],
+                        'url': row[1],
+                        'name': row[2],
+                        'is_active': bool(row[3]),
+                        'is_paywalled': bool(row[4]),
+                        'last_fetch': row[5],
+                        'created_at': row[6]
+                    }
+                return None
+        except Exception as e:
+            logging.error(f"Error getting feed {feed_id}: {e}")
+            return None
+    
+    def get_feed_articles(self, feed_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all articles for a specific feed.
+        
+        Args:
+            feed_id (int): The feed ID
+            
+        Returns:
+            List[Dict[str, Any]]: List of articles for the feed
+        """
+        try:
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # Check if feed exists
+                c.execute('SELECT 1 FROM feeds WHERE id = ?', (feed_id,))
+                if not c.fetchone():
+                    logging.warning(f"Feed {feed_id} does not exist")
+                    return []
+                
+                c.execute('''
+                    SELECT id, url, title, content, author, published_date, 
+                           processed, wordpress_post_id, created_at
+                    FROM articles
+                    WHERE feed_id = ?
+                    ORDER BY published_date DESC
+                ''', (feed_id,))
+                
+                columns = [description[0] for description in c.description]
+                articles = []
+                
+                for row in c.fetchall():
+                    article = dict(zip(columns, row))
+                    # Convert timestamps to ISO format
+                    for key in ['published_date', 'created_at']:
+                        if article[key]:
+                            article[key] = datetime.fromisoformat(article[key]).isoformat()
+                    articles.append(article)
+                
+                return articles
+        except Exception as e:
+            logging.error(f"Error getting articles for feed {feed_id}: {e}")
+            return []
+    
+    def get_unprocessed_articles(self) -> List[Dict[str, Any]]:
+        """
+        Get all unprocessed articles.
+        
+        Returns:
+            List[Dict[str, Any]]: List of unprocessed articles
+        """
+        try:
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                c.execute('''
+                    SELECT id, url, title, content, author, published_date, 
+                           processed, wordpress_post_id, created_at, feed_id
+                    FROM articles
+                    WHERE processed = 0
+                    ORDER BY published_date DESC
+                ''')
+                
+                columns = [description[0] for description in c.description]
+                articles = []
+                
+                for row in c.fetchall():
+                    article = dict(zip(columns, row))
+                    # Convert timestamps to ISO format
+                    for key in ['published_date', 'created_at']:
+                        if article[key]:
+                            article[key] = datetime.fromisoformat(article[key]).isoformat()
+                    articles.append(article)
+                
+                return articles
+        except Exception as e:
+            logging.error(f"Error getting unprocessed articles: {e}")
+            return [] 
