@@ -4,10 +4,10 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from urllib.parse import urljoin  # Import urljoin to handle relative URLs
 from article_scraper import HeadlineGrabber, ArticleScraper  # Import from article_scraper.py
-from article_rewriter import ArticleRewriter  # Import the ArticleRewriter class
 from wordpress_poster import WordPressPoster  # Import the WordPressPoster class
 from rss_monitor import RSSMonitor  # Import the RSSMonitor class
 from webdriver_manager.chrome import ChromeDriverManager  # Import ChromeDriverManager
+from logger import main_logger as logger
 import logging
 import time
 import json
@@ -22,6 +22,7 @@ from pathlib import Path
 from database import Database
 from lm_studio import LMStudio
 from tag_manager import TagManager
+import requests
 
 # Load configuration from config.json
 def load_config():
@@ -44,19 +45,26 @@ def load_config():
             "lm_studio": {}
         }
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Article Monitor & Rewriter')
+    parser.add_argument('--limit', type=int, help='Process only N articles')
+    parser.add_argument('--skip-rewrite', action='store_true', help='Skip article rewriting')
+    parser.add_argument('--skip-wordpress', action='store_true', help='Skip WordPress posting')
+    parser.add_argument('--add-feed', type=str, help='Add a new RSS feed')
+    parser.add_argument('--remove-feed', type=str, help='Remove an RSS feed')
+    parser.add_argument('--list-feeds', action='store_true', help='List all configured feeds')
+    parser.add_argument('--add-thematic-prompt', action='store_true', help='Add a thematic prompt')
+    parser.add_argument('--tag-name', type=str, help='Tag name for thematic prompt')
+    parser.add_argument('--prompt', type=str, help='Prompt text for thematic prompt')
+    return parser.parse_args()
+
 # Config variables
 CONFIG = load_config()
 
-# Configure logging
-log_level = getattr(logging, CONFIG["general"]["log_level"], logging.INFO)
-logging.basicConfig(
-    level=log_level,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("webscraper.log"),
-        logging.StreamHandler()
-    ]
-)
+# Configure logging level from config
+log_level = CONFIG["general"].get("log_level", "INFO")
+logger.setLevel(getattr(logging, log_level, logging.INFO))
 
 # Define the website URL to monitor from config
 website_url = CONFIG["monitor"]["website_url"]
@@ -93,7 +101,7 @@ def load_state(filename: str = 'processing_state.json') -> Optional[ProcessingSt
     except FileNotFoundError:
         return None
     except Exception as e:
-        logging.error(f"Error loading state: {e}")
+        logger.error(f"Error loading state: {e}")
         return None
 
 def handle_error(error: Exception, state: ProcessingState, driver: Optional[webdriver.Chrome] = None):
@@ -106,14 +114,14 @@ def handle_error(error: Exception, state: ProcessingState, driver: Optional[webd
         try:
             driver.save_screenshot(f"error_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
         except Exception as e:
-            logging.error(f"Failed to save error screenshot: {e}")
+            logger.error(f"Failed to save error screenshot: {e}")
     
-    logging.error(f"Error occurred during {state.current_stage}: {error}")
-    logging.error(f"Traceback: {state.error_traceback}")
+    logger.error(f"Error occurred during {state.current_stage}: {error}")
+    logger.error(f"Traceback: {state.error_traceback}")
 
 def recover_from_error(state: ProcessingState, driver: webdriver.Chrome) -> Dict[str, Any]:
     """Attempt to recover from a processing error."""
-    logging.info(f"Attempting to recover from error in stage: {state.current_stage}")
+    logger.info(f"Attempting to recover from error in stage: {state.current_stage}")
     
     if state.current_stage == 'monitoring':
         # Retry monitoring from scratch
@@ -129,7 +137,7 @@ def recover_from_error(state: ProcessingState, driver: webdriver.Chrome) -> Dict
                 articles = json.load(f)
             return articles
         except FileNotFoundError:
-            logging.error("No articles data found for recovery")
+            logger.error("No articles data found for recovery")
             return {}
     elif state.current_stage == 'posting':
         # Load rewritten articles and retry failed ones
@@ -138,7 +146,7 @@ def recover_from_error(state: ProcessingState, driver: webdriver.Chrome) -> Dict
                 articles = json.load(f)
             return articles
         except FileNotFoundError:
-            logging.error("No rewritten articles found for recovery")
+            logger.error("No rewritten articles found for recovery")
             return {}
     
     return {}
@@ -183,7 +191,7 @@ def monitor_website(driver):
     Returns:
         list: A list of unique external links found in the main posts loop.
     """
-    logging.info(f"Monitoring website: {website_url}")
+    logger.info(f"Monitoring website: {website_url}")
     driver.get(website_url)  # Open the website in the browser
     soup = BeautifulSoup(driver.page_source, 'html.parser')  # Parse the page source with BeautifulSoup
     links = set()  # Use a set to store unique links
@@ -213,7 +221,7 @@ def monitor_website(driver):
     # Filter out any remaining navigation or utility links
     filtered_links = {link for link in links if not any(x in link.lower() for x in ['#', 'page=', 'feed', '/wp-', '/tag/', '/category/', '/author/'])}
     
-    logging.info(f"Found {len(filtered_links)} unique article links")
+    logger.info(f"Found {len(filtered_links)} unique article links")
     return list(filtered_links)  # Convert the set back to a list and return it
 
 def get_article_links() -> List[str]:
@@ -232,18 +240,18 @@ def get_article_links() -> List[str]:
         
         # Print feed statistics
         stats = rss_monitor.get_feed_stats()
-        logging.info(f"RSS Feed Statistics:")
-        logging.info(f"- Total feeds: {stats['total_feeds']}")
-        logging.info(f"- Active feeds: {stats['active_feeds']}")
-        logging.info(f"- Total processed entries: {stats['total_entries']}")
+        logger.info(f"RSS Feed Statistics:")
+        logger.info(f"- Total feeds: {stats['total_feeds']}")
+        logger.info(f"- Active feeds: {stats['active_feeds']}")
+        logger.info(f"- Total processed entries: {stats['total_entries']}")
         if stats['top_feeds']:
-            logging.info("Top feeds by entry count:")
+            logger.info("Top feeds by entry count:")
             for feed in stats['top_feeds']:
-                logging.info(f"  - {feed['url']}: {feed['entry_count']} entries")
+                logger.info(f"  - {feed['url']}: {feed['entry_count']} entries")
         
         # Get article links with detailed logging
         links = rss_monitor.get_article_links()
-        logging.info(f"Found {len(links)} unique article links from RSS feeds")
+        logger.info(f"Found {len(links)} unique article links from RSS feeds")
         
         # Log feed health status
         active_feeds = rss_monitor.db.get_active_feeds()
@@ -251,11 +259,11 @@ def get_article_links() -> List[str]:
             try:
                 feed_data = rss_monitor._fetch_feed(feed['url'])
                 if feed_data:
-                    logging.info(f"Feed {feed['url']} is healthy with {len(feed_data.entries)} entries")
+                    logger.info(f"Feed {feed['url']} is healthy with {len(feed_data.entries)} entries")
                 else:
-                    logging.warning(f"Feed {feed['url']} is not responding or has errors")
+                    logger.warning(f"Feed {feed['url']} is not responding or has errors")
             except Exception as e:
-                logging.error(f"Error checking feed health for {feed['url']}: {e}")
+                logger.error(f"Error checking feed health for {feed['url']}: {e}")
         
         return links
     else:
@@ -287,7 +295,7 @@ def process_links(driver: Optional[webdriver.Chrome], links: List[str], rss_moni
         try:
             if CONFIG["monitor"].get("use_rss", False):
                 # For RSS feeds, get the article data directly
-                logging.info(f"Processing RSS article: {link}")
+                logger.info(f"Processing RSS article: {link}")
                 article_data = rss_monitor.get_article_by_link(link) if rss_monitor else None
                 if article_data:
                     articles_by_link[link] = {
@@ -300,33 +308,33 @@ def process_links(driver: Optional[webdriver.Chrome], links: List[str], rss_moni
                         'feed_title': article_data['feed_title']
                     }
                     processed_count += 1
-                    logging.info(f"Successfully extracted article: {article_data['title']}")
-                    logging.info(f"Found {len(article_data['paragraphs'])} paragraphs")
+                    logger.info(f"Successfully extracted article: {article_data['title']}")
+                    logger.info(f"Found {len(article_data['paragraphs'])} paragraphs")
                 else:
                     failed_count += 1
-                    logging.warning(f"Failed to extract article data for link: {link}")
+                    logger.warning(f"Failed to extract article data for link: {link}")
             else:
                 # For website scraping, use the existing process
                 driver.set_page_load_timeout(10)
-                logging.info(f"Processing website link: {link}")
+                logger.info(f"Processing website link: {link}")
                 driver.get(link)
                 article_data = ArticleScraper(driver.page_source, link)
                 articles_by_link[link] = article_data
                 processed_count += 1
-                logging.info(f"Successfully extracted article: {article_data['title']}")
-                logging.info(f"Found {len(article_data['paragraphs'])} paragraphs")
+                logger.info(f"Successfully extracted article: {article_data['title']}")
+                logger.info(f"Found {len(article_data['paragraphs'])} paragraphs")
         except Exception as e:
             failed_count += 1
-            logging.error(f"Error processing link {link}: {e}")
-            logging.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Error processing link {link}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             articles_by_link[link] = None
 
     # Log processing summary
-    logging.info(f"\nProcessing Summary:")
-    logging.info(f"- Total links processed: {len(links)}")
-    logging.info(f"- Successfully processed: {processed_count}")
-    logging.info(f"- Failed to process: {failed_count}")
-    logging.info(f"- Success rate: {(processed_count/len(links))*100:.1f}%")
+    logger.info(f"\nProcessing Summary:")
+    logger.info(f"- Total links processed: {len(links)}")
+    logger.info(f"- Successfully processed: {processed_count}")
+    logger.info(f"- Failed to process: {failed_count}")
+    logger.info(f"- Success rate: {(processed_count/len(links))*100:.1f}%")
 
     return articles_by_link
 
@@ -345,9 +353,9 @@ def import_feeds_from_csv(csv_path: str) -> None:
     print(f"Successfully added: {stats['successful']}")
     print(f"Failed to add: {stats['failed']}")
 
-def list_feeds(include_inactive: bool = False) -> None:
+def list_feeds(db: Database, include_inactive: bool = False) -> None:
     """List all configured feeds."""
-    feeds = rss_monitor.db.list_feeds(include_inactive)
+    feeds = db.list_feeds(include_inactive)
     
     if not feeds:
         print("No feeds configured.")
@@ -367,151 +375,194 @@ def list_feeds(include_inactive: bool = False) -> None:
     
     print("-" * 80)
 
-def process_articles(monitor: RSSMonitor, tag_manager: TagManager, 
-                    lm_studio: Optional[LMStudio] = None,
-                    wordpress: Optional[WordPressPoster] = None,
-                    limit: Optional[int] = None,
-                    skip_rewrite: bool = False,
-                    skip_wordpress: bool = False) -> Dict[str, Dict[str, Any]]:
-    """Process articles from RSS feeds."""
-    articles = {}
+def process_articles(monitor: RSSMonitor, tag_manager: TagManager, lm_studio: LMStudio, wordpress: WordPressPoster, limit: int = None, skip_rewrite: bool = False, skip_wordpress: bool = False):
+    """
+    Process articles from RSS feeds and optionally post to WordPress.
     
-    # Get entries from RSS feeds
-    entries = monitor.get_entries()
-    if limit:
-        entries = entries[:limit]
-    
-    total_entries = len(entries)
-    processed = 0
-    failed = 0
-    
-    for entry in entries:
-        try:
-            url = entry.get('link')
-            if not url:
+    Args:
+        monitor (RSSMonitor): RSS monitor instance
+        tag_manager (TagManager): Tag manager instance
+        lm_studio (LMStudio): LMStudio instance for rewriting
+        wordpress (WordPressPoster): WordPress poster instance
+        limit (int, optional): Maximum number of articles to process
+        skip_rewrite (bool): Whether to skip rewriting
+        skip_wordpress (bool): Whether to skip WordPress posting
+    """
+    try:
+        # Get articles from RSS feeds
+        articles = monitor.get_articles(limit=limit)
+        if not articles:
+            logger.info("No new articles found in RSS feeds")
+            return
+
+        logger.info(f"Processing {len(articles)} articles from RSS feeds")
+        processed_count = 0
+        success_count = 0
+
+        for url, article in articles.items():
+            try:
+                processed_count += 1
+                logger.info(f"Processing article {processed_count}/{len(articles)}: {url}")
+
+                # Skip if already processed
+                if article.get('processed'):
+                    logger.info(f"Skipping already processed article: {url}")
+                    continue
+
+                # Rewrite content if enabled
+                if not skip_rewrite and CONFIG["general"]["auto_rewrite"]:
+                    logger.info(f"Rewriting content for article: {url}")
+                    rewritten_article = lm_studio.rewrite_article(article)
+                    if rewritten_article:
+                        # Update article with rewritten content
+                        article.update({
+                            'url': url,
+                            'title': rewritten_article.get('title', article['title']),
+                            'content': '\n\n'.join(rewritten_article.get('paragraphs', [])),
+                            'ai_metadata': {
+                                'generated_by': 'LMStudio',
+                                'generation_date': datetime.now().isoformat(),
+                                'original_source': url
+                            }
+                        })
+                    else:
+                        logger.error(f"Failed to rewrite content for article: {url}")
+                        continue
+
+                # Generate tags
+                if not article.get('tags'):
+                    logger.info(f"Generating tags for article: {url}")
+                    article['tags'] = tag_manager.generate_tags(article)
+
+                # Post to WordPress if enabled
+                if not skip_wordpress and CONFIG["general"]["auto_post"]:
+                    logger.info(f"Posting article to WordPress: {url}")
+                    try:
+                        post_result = wordpress.create_post(
+                            article_data=article,
+                            status=CONFIG["wordpress"]["default_status"]
+                        )
+                        if post_result:
+                            logger.info(f"Successfully posted article to WordPress: {url}")
+                            article['wordpress_post_id'] = post_result
+                        else:
+                            logger.error(f"Failed to post article to WordPress: {url}")
+                    except Exception as e:
+                        logger.error(f"Error posting to WordPress: {str(e)}")
+                        continue
+
+                # Mark as processed
+                article['processed'] = True
+                success_count += 1
+                logger.info(f"Successfully processed article: {url}")
+
+            except Exception as e:
+                logger.error(f"Error processing article {url}: {str(e)}")
                 continue
-                
-            logging.info(f"Processing article: {url}")
-            
-            # Extract content
-            content = monitor._extract_article_content(url)
-            if not content:
-                failed += 1
-                continue
-            
-            # Generate tags
-            tags = tag_manager.generate_tags(
-                content=content.get('content', ''),
-                title=content.get('title', ''),
-                existing_tags=entry.get('tags', [])
-            )
-            
-            # Add tags to article data
-            content['tags'] = tags
-            
-            # Add to articles dictionary
-            articles[url] = content
-            
-            processed += 1
-            logging.info(f"Successfully processed {processed}/{total_entries} articles")
-            
-        except Exception as e:
-            logging.error(f"Error processing article {url}: {e}")
-            failed += 1
-            continue
-    
-    # Save articles to file
-    save_articles(articles)
-    
-    # Print summary
-    logging.info(f"""
-Processing Summary:
-------------------
-Total entries: {total_entries}
-Successfully processed: {processed}
-Failed to process: {failed}
-Success rate: {(processed/total_entries)*100:.1f}%
-    """)
-    
-    return articles
+
+        # Save processed articles
+        monitor.save_articles(articles)
+        logger.info(f"Processed {processed_count} articles, {success_count} successful")
+
+    except Exception as e:
+        logger.error(f"Error in process_articles: {str(e)}")
+        raise
 
 def add_thematic_prompt(tag_manager: TagManager, tag_name: str, prompt: str) -> bool:
     """Add a thematic prompt for tag generation."""
     try:
         success = tag_manager.add_thematic_prompt(tag_name, prompt)
         if success:
-            logging.info(f"Successfully added thematic prompt for tag: {tag_name}")
+            logger.info(f"Successfully added thematic prompt for tag: {tag_name}")
         else:
-            logging.error(f"Failed to add thematic prompt for tag: {tag_name}")
+            logger.error(f"Failed to add thematic prompt for tag: {tag_name}")
         return success
     except Exception as e:
-        logging.error(f"Error adding thematic prompt: {e}")
+        logger.error(f"Error adding thematic prompt: {e}")
         return False
 
+def save_articles(articles: Dict[str, Dict[str, Any]], filename: str = 'articles_data.json') -> None:
+    """
+    Save processed articles to a JSON file.
+    
+    Args:
+        articles (Dict[str, Dict[str, Any]]): Dictionary of processed articles
+        filename (str): Output JSON file name
+    """
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(articles, f, ensure_ascii=False, indent=4)
+        logger.info(f"Saved {len(articles)} articles to {filename}")
+    except Exception as e:
+        logger.error(f"Error saving articles to {filename}: {e}")
+
 def main():
-    parser = argparse.ArgumentParser(description='Article Monitor & Rewriter')
-    parser.add_argument('--limit', type=int, help='Process only N articles')
-    parser.add_argument('--skip-rewrite', action='store_true', help='Skip the article rewriting step')
-    parser.add_argument('--skip-wordpress', action='store_true', help='Skip WordPress posting')
-    parser.add_argument('--force-refresh', action='store_true', help='Force refresh of cached content')
-    parser.add_argument('--add-feed', help='Add a new RSS feed URL')
-    parser.add_argument('--feed-name', help='Name for the new feed')
-    parser.add_argument('--import-csv', help='Import feeds from a CSV file')
-    parser.add_argument('--list-feeds', action='store_true', help='List all configured feeds')
-    parser.add_argument('--include-inactive', action='store_true', help='Include inactive feeds in listing')
-    parser.add_argument('--remove-feed', type=int, help='Remove a feed by its ID')
-    parser.add_argument('--toggle-feed', type=int, help='Enable/disable a feed')
-    parser.add_argument('--show-stats', action='store_true', help='Display feed statistics')
-    parser.add_argument('--add-thematic-prompt', nargs=2, metavar=('TAG', 'PROMPT'), 
-                       help="Add a thematic prompt for tag generation")
-    
-    args = parser.parse_args()
-    
-    if args.add_feed:
-        add_feed(args.add_feed, args.feed_name)
-        return
-    
-    if args.import_csv:
-        import_feeds_from_csv(args.import_csv)
-        return
-    
-    if args.list_feeds:
-        list_feeds(args.include_inactive)
-        return
-    
-    if args.remove_feed:
-        if rss_monitor.db.remove_feed(args.remove_feed):
-            print(f"Successfully removed feed {args.remove_feed}")
+    try:
+        args = parse_args()
+        
+        # Initialize database
+        db = Database()
+        logger.info("Database initialized")
+        
+        # Initialize tag manager
+        tag_manager = TagManager(db=db)
+        logger.info("Tag manager initialized")
+        
+        # Initialize LMStudio if enabled
+        lm_studio = None
+        if CONFIG["lm_studio"].get("use_lm_studio", False):
+            lm_studio = LMStudio(
+                url=CONFIG["lm_studio"].get("url", "http://localhost:1234/v1"),
+                model=CONFIG["lm_studio"].get("model", "mistral-7b-instruct-v0.3")
+            )
+            logger.info("LMStudio initialized")
+        
+        # Initialize WordPress if enabled
+        wordpress = None
+        if not args.skip_wordpress and CONFIG["wordpress"]:
+            wordpress = WordPressPoster(
+                wp_url=CONFIG["wordpress"]["url"],
+                username=CONFIG["wordpress"]["username"],
+                password=CONFIG["wordpress"]["password"]
+            )
+            logger.info("WordPress initialized")
+        
+        # Initialize monitor with database
+        monitor = RSSMonitor(
+            db=db,
+            max_entries=CONFIG["monitor"].get("rss_max_entries", 10),
+            max_retries=CONFIG["monitor"].get("rss_max_retries", 3),
+            retry_delay=CONFIG["monitor"].get("rss_retry_delay", 5)
+        )
+        logger.info("RSS Monitor initialized")
+        
+        # Handle command line arguments
+        if args.add_feed:
+            add_feed(db, args.add_feed)
+        elif args.remove_feed:
+            remove_feed(db, args.remove_feed)
+        elif args.list_feeds:
+            list_feeds(db)
+        elif args.add_thematic_prompt:
+            if not args.tag_name or not args.prompt:
+                logger.error("Both --tag-name and --prompt are required with --add-thematic-prompt")
+                sys.exit(1)
+            add_thematic_prompt(tag_manager, args.tag_name, args.prompt)
         else:
-            print(f"Failed to remove feed {args.remove_feed}")
-        return
+            # Process articles
+            process_articles(
+                monitor=monitor,
+                tag_manager=tag_manager,
+                lm_studio=lm_studio,
+                wordpress=wordpress,
+                limit=args.limit,
+                skip_rewrite=args.skip_rewrite,
+                skip_wordpress=args.skip_wordpress
+            )
     
-    if args.toggle_feed:
-        if rss_monitor.db.toggle_feed(args.toggle_feed):
-            print(f"Successfully toggled feed {args.toggle_feed}")
-        else:
-            print(f"Failed to toggle feed {args.toggle_feed}")
-        return
-    
-    if args.show_stats:
-        stats = rss_monitor.get_feed_stats()
-        print("\nFeed Statistics:")
-        print("-" * 80)
-        print(f"Total feeds: {stats['total_feeds']}")
-        print(f"Active feeds: {stats['active_feeds']}")
-        print(f"Paywalled feeds: {stats['paywalled_feeds']}")
-        print(f"Total paywall hits: {stats['total_paywall_hits']}")
-        print(f"Total articles processed: {stats['total_articles']}")
-        print("-" * 80)
-        return
-    
-    if args.add_thematic_prompt:
-        tag_name, prompt = args.add_thematic_prompt
-        add_thematic_prompt(tag_manager, tag_name, prompt)
-        return
-    
-    # Process articles
-    process_articles(args.limit, args.skip_rewrite, args.skip_wordpress, args.force_refresh)
+    except Exception as e:
+        logger.error(f"Error in main: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()

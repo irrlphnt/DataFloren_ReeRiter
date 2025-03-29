@@ -7,23 +7,14 @@ from urllib.parse import urljoin
 from datetime import datetime
 import base64
 from typing import Dict, Any, Optional
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("wordpress.log"),
-        logging.StreamHandler()
-    ]
-)
+from logger import wordpress_logger as logger
 
 class WordPressPoster:
     """
     A class for posting articles to WordPress using the WordPress REST API.
     """
     
-    def __init__(self, wp_url, username, password, api_version="wp/v2"):
+    def __init__(self, wp_url: str, username: str, password: str, api_version: str = "wp/v2"):
         """
         Initialize the WordPressPoster with WordPress credentials.
         
@@ -37,15 +28,16 @@ class WordPressPoster:
         self.api_base = f"{self.wp_url}/wp-json/{api_version}"
         self.username = username
         self.password = password
-        self.auth = base64.b64encode(f"{username}:{password}".encode()).decode()
         self.headers = {
-            'Authorization': f'Basic {self.auth}',
-            'Content-Type': 'application/json'
+            'Authorization': f'Basic {base64.b64encode(f"{username}:{password}".encode()).decode()}'
         }
         
         # Cache to avoid reposting the same articles
         self.cache_file = "wordpress_cache.json"
         self.cache = self._load_cache()
+        
+        # Test connection
+        self.test_connection()
         
     def _load_cache(self):
         """Load the cache from file if it exists."""
@@ -55,7 +47,7 @@ class WordPressPoster:
                     return json.load(f)
             return {}
         except Exception as e:
-            logging.error(f"Error loading cache: {e}")
+            logger.error(f"Error loading cache: {e}")
             return {}
             
     def _save_cache(self):
@@ -64,9 +56,9 @@ class WordPressPoster:
             with open(self.cache_file, 'w', encoding='utf-8') as f:
                 json.dump(self.cache, f, ensure_ascii=False, indent=4)
         except Exception as e:
-            logging.error(f"Error saving cache: {e}")
+            logger.error(f"Error saving cache: {e}")
     
-    def test_connection(self):
+    def test_connection(self) -> bool:
         """
         Test the connection to the WordPress API.
         
@@ -76,13 +68,13 @@ class WordPressPoster:
         try:
             response = requests.get(f"{self.api_base}/posts", headers=self.headers)
             if response.status_code == 200:
-                logging.info("Successfully connected to WordPress API")
+                logger.info("Successfully connected to WordPress API")
                 return True
             else:
-                logging.error(f"Failed to connect to WordPress API: {response.status_code} - {response.text}")
+                logger.error(f"Failed to connect to WordPress API: {response.status_code}")
                 return False
         except Exception as e:
-            logging.error(f"Error testing connection to WordPress API: {e}")
+            logger.error(f"Error connecting to WordPress API: {str(e)}")
             return False
     
     def upload_media(self, image_url):
@@ -99,7 +91,7 @@ class WordPressPoster:
             # Download the image
             response = requests.get(image_url, stream=True)
             if response.status_code != 200:
-                logging.error(f"Failed to download image from {image_url}: {response.status_code}")
+                logger.error(f"Failed to download image from {image_url}: {response.status_code}")
                 return None
                 
             # Determine the filename from the URL
@@ -118,21 +110,21 @@ class WordPressPoster:
             upload_response = requests.post(
                 f"{self.api_base}/media",
                 headers={
-                    'Authorization': f'Basic {self.auth}'
+                    'Authorization': f'Basic {base64.b64encode(f"{self.username}:{self.password}".encode()).decode()}'
                 },
                 files=files
             )
             
             if upload_response.status_code in (201, 200):
                 media_data = upload_response.json()
-                logging.info(f"Successfully uploaded image: {filename}")
+                logger.info(f"Successfully uploaded image: {filename}")
                 return media_data.get('id')
             else:
-                logging.error(f"Failed to upload image: {upload_response.status_code} - {upload_response.text}")
+                logger.error(f"Failed to upload image: {upload_response.status_code} - {upload_response.text}")
                 return None
                 
         except Exception as e:
-            logging.error(f"Error uploading media {image_url}: {e}")
+            logger.error(f"Error uploading media {image_url}: {e}")
             return None
     
     def create_post_content(self, article_data: Dict[str, Any]) -> str:
@@ -177,13 +169,13 @@ class WordPressPoster:
         """
         # Skip if article title or paragraphs are missing
         if not article_data or not article_data.get('title') or not article_data.get('paragraphs'):
-            logging.warning("Cannot create post: Missing title or content")
+            logger.warning("Cannot create post: Missing title or content")
             return None
             
         # Check if this article is already in the cache
         cache_key = article_data.get('title', '')
         if cache_key in self.cache:
-            logging.info(f"Article already posted: {cache_key}")
+            logger.info(f"Article already posted: {cache_key}")
             return self.cache[cache_key]
             
         # Prepare post content
@@ -219,7 +211,7 @@ class WordPressPoster:
             
             if response.status_code in (201, 200):
                 post_data = response.json()
-                logging.info(f"Successfully created post: {post_data.get('id')} - {article_data.get('title')}")
+                logger.info(f"Successfully created post: {post_data.get('id')} - {article_data.get('title')}")
                 
                 # Save to cache
                 self.cache[cache_key] = post_data
@@ -227,11 +219,11 @@ class WordPressPoster:
                 
                 return post_data
             else:
-                logging.error(f"Failed to create post: {response.status_code} - {response.text}")
+                logger.error(f"Failed to create post: {response.status_code} - {response.text}")
                 return None
                 
         except Exception as e:
-            logging.error(f"Error creating post {article_data.get('title')}: {e}")
+            logger.error(f"Error creating post {article_data.get('title')}: {e}")
             return None
     
     def post_article(self, article_data, status="draft", upload_images=True, categories=None, tags=None):
@@ -248,7 +240,7 @@ class WordPressPoster:
         Returns:
             dict: The created post data if successful, None otherwise.
         """
-        logging.info(f"Posting article: {article_data.get('title', 'Untitled')}")
+        logger.info(f"Posting article: {article_data.get('title', 'Untitled')}")
         
         featured_media_id = None
         
@@ -260,12 +252,12 @@ class WordPressPoster:
                 featured_media_id = self.upload_media(first_image)
                 
                 if featured_media_id:
-                    logging.info(f"Set featured image with ID: {featured_media_id}")
+                    logger.info(f"Set featured image with ID: {featured_media_id}")
                 else:
-                    logging.warning("Failed to set featured image")
+                    logger.warning("Failed to set featured image")
                     
             except Exception as e:
-                logging.error(f"Error handling images: {e}")
+                logger.error(f"Error handling images: {e}")
         
         # Create the post
         return self.create_post(
@@ -315,11 +307,11 @@ class WordPressPoster:
             if response.status_code in (201, 200):
                 return response.json()['id']
             else:
-                logging.error(f"Failed to create tag '{tag_name}': {response.text}")
+                logger.error(f"Failed to create tag '{tag_name}': {response.text}")
                 return None
             
         except Exception as e:
-            logging.error(f"Error handling tag '{tag_name}': {e}")
+            logger.error(f"Error handling tag '{tag_name}': {e}")
             return None
 
     def post_batch(self, articles: Dict[str, Dict[str, Any]], status: str = "draft", 
@@ -373,12 +365,12 @@ class WordPressPoster:
                         'ai_metadata': article_data.get('ai_metadata', {}),
                         'tags': article_data.get('tags', [])
                     }
-                    logging.info(f"Successfully posted article from {url}")
+                    logger.info(f"Successfully posted article from {url}")
                 else:
-                    logging.error(f"Failed to post article from {url}: {response.text}")
+                    logger.error(f"Failed to post article from {url}: {response.text}")
                     
             except Exception as e:
-                logging.error(f"Error posting article from {url}: {e}")
+                logger.error(f"Error posting article from {url}: {e}")
                 continue
         
         return posted_articles

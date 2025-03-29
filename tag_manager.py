@@ -2,6 +2,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from database import Database
 from lm_studio import LMStudio
+from logger import tag_logger as logger
 
 class TagManager:
     """Manages tag generation and handling for articles."""
@@ -16,52 +17,40 @@ class TagManager:
         """
         self.db = db
         self.lm_studio = lm_studio
+        self.thematic_prompts = {}
+        logger.info("Tag manager initialized")
     
-    def generate_tags(self, content: str, title: str, existing_tags: List[str] = None, 
-                     max_tags: int = 5) -> List[str]:
+    def generate_tags(self, article: Dict[str, Any], max_tags: int = 5) -> List[str]:
         """
         Generate tags for an article using AI and existing tag suggestions.
         
         Args:
-            content (str): Article content
-            title (str): Article title
-            existing_tags (List[str], optional): Existing tags to consider
+            article (Dict[str, Any]): Article data containing title, content, etc.
             max_tags (int): Maximum number of tags to generate
             
         Returns:
             List[str]: Generated tags
         """
         if not self.lm_studio:
-            logging.warning("LMStudio not configured, falling back to basic tag suggestions")
-            return self._get_basic_suggestions(content, title, max_tags)
+            logger.warning("LMStudio not configured, falling back to basic tag suggestions")
+            return self._get_basic_suggestions(article.get('content', ''), article.get('title', ''), max_tags)
         
         # Get thematic prompts and existing tags
         thematic_prompts = self.db.get_thematic_prompts()
-        tag_suggestions = self.db.get_tag_suggestions(content)
+        tag_suggestions = self.db.get_tag_suggestions(article.get('content', ''))
         
-        # Prepare the prompt
-        prompt = self._create_tag_generation_prompt(
-            content, title, existing_tags, thematic_prompts, tag_suggestions
-        )
+        # Combine content and title for better context
+        content = f"{article.get('title', '')}\n\n{article.get('content', '')}"
         
-        try:
-            # Generate tags using LMStudio
-            response = self.lm_studio.generate(prompt)
-            if not response:
-                return self._get_basic_suggestions(content, title, max_tags)
-            
-            # Parse and normalize the generated tags
-            generated_tags = self._parse_generated_tags(response, max_tags)
-            
-            # Add generated tags to the database
-            for tag in generated_tags:
-                self.db.add_tag(tag, source='ai')
-            
-            return generated_tags
-            
-        except Exception as e:
-            logging.error(f"Error generating tags with AI: {e}")
-            return self._get_basic_suggestions(content, title, max_tags)
+        # Generate tags using LMStudio
+        prompt = self._construct_tag_prompt(content, thematic_prompts, tag_suggestions)
+        tags = self._generate_tags_with_lm_studio(prompt)
+        
+        # Filter and normalize tags
+        normalized_tags = self._normalize_tags(tags)
+        
+        # Return up to max_tags tags
+        return normalized_tags[:max_tags]
     
     def _create_tag_generation_prompt(self, content: str, title: str, 
                                     existing_tags: List[str],
@@ -161,7 +150,13 @@ Format: Return only the tags, one per line, without any additional text or forma
         Returns:
             bool: True if successful, False otherwise
         """
-        return self.db.add_thematic_prompt(tag_name, prompt)
+        try:
+            self.thematic_prompts[tag_name] = prompt
+            logger.info(f"Added thematic prompt for tag: {tag_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding thematic prompt: {e}")
+            return False
     
     def get_article_tags(self, article_url: str) -> List[Dict[str, Any]]:
         """

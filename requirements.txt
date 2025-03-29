@@ -1,7 +1,8 @@
-beautifulsoup4>=4.12.3
-selenium>=4.18.1
-webdriver-manager>=4.0.1
-feedparser>=6.0.11
-python-wordpress-xmlrpc>=2.3
+beautifulsoup4>=4.12.0
+selenium>=4.15.0
 requests>=2.31.0
-python-dotenv>=1.0.1 
+webdriver-manager>=4.0.1
+openai>=1.3.0
+python-dotenv>=1.0.0
+feedparser>=6.0.10
+lxml>=4.9.3 

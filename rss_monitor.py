@@ -10,18 +10,20 @@ from time import mktime
 from bs4 import BeautifulSoup
 import requests
 from requests.exceptions import RequestException
+from logger import rss_logger as logger
+import sqlite3
 
 class RSSMonitor:
     """
     A class to monitor RSS feeds and extract article information.
     """
     
-    def __init__(self, feed_urls: List[str] = None, max_entries: int = 10, max_retries: int = 3, retry_delay: int = 5):
+    def __init__(self, db: Database, max_entries: int = 10, max_retries: int = 3, retry_delay: int = 5):
         """
         Initialize the RSS monitor.
         
         Args:
-            feed_urls (List[str], optional): List of RSS feed URLs to monitor
+            db (Database): Database instance for storing feed information
             max_entries (int): Maximum number of entries to process per feed
             max_retries (int): Maximum number of retries for failed requests
             retry_delay (int): Delay between retries in seconds
@@ -29,18 +31,20 @@ class RSSMonitor:
         self.max_entries = max_entries
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.db = Database()
+        self.db = db
         self._cached_entries = []  # Cache for entries
         
         # Load configuration
         with open('config.json', 'r') as f:
             config = json.load(f)
             self.config = config.get('monitor', {})
-        
-        # Add feeds to database if provided
-        if feed_urls:
+            
+            # Add feeds from config if they don't exist
+            feed_urls = self.config.get('rss_feeds', [])
             for url in feed_urls:
                 self.db.add_feed(url)
+        
+        logger.info("RSS Monitor initialized")
     
     def _fetch_url(self, url: str, is_feed: bool = True) -> Optional[str]:
         """
@@ -68,24 +72,24 @@ class RSSMonitor:
                 if attempt > 0:
                     # Add increasing delay between retries
                     delay = self.retry_delay * (attempt + 1)
-                    logging.info(f"Waiting {delay} seconds before retry...")
+                    logger.info(f"Waiting {delay} seconds before retry...")
                     time.sleep(delay)
                 
-                logging.info(f"Fetching {'RSS feed' if is_feed else 'article'}: {url} (attempt {attempt + 1}/{self.max_retries})")
+                logger.info(f"Fetching {'RSS feed' if is_feed else 'article'}: {url} (attempt {attempt + 1}/{self.max_retries})")
                 response = requests.get(url, timeout=timeout, headers=headers)
                 
                 # Handle common status codes
                 if response.status_code == 403:
-                    logging.warning(f"Access forbidden to {url}. Site may have anti-scraping measures.")
+                    logger.warning(f"Access forbidden to {url}. Site may have anti-scraping measures.")
                     # Try with a different user agent on next attempt
                     headers['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1'
                     continue
                 elif response.status_code == 429:
-                    logging.warning(f"Rate limited by {url}. Waiting longer before retry...")
+                    logger.warning(f"Rate limited by {url}. Waiting longer before retry...")
                     time.sleep(self.retry_delay * 5)  # Wait 5 times longer
                     continue
                 elif response.status_code == 404:
-                    logging.error(f"Page not found: {url}")
+                    logger.error(f"Page not found: {url}")
                     return None
                 
                 response.raise_for_status()
@@ -93,7 +97,7 @@ class RSSMonitor:
                 # Check if we got a valid response
                 content_type = response.headers.get('content-type', '').lower()
                 if not is_feed and 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
-                    logging.warning(f"Unexpected content type from {url}: {content_type}")
+                    logger.warning(f"Unexpected content type from {url}: {content_type}")
                     if attempt < self.max_retries - 1:
                         continue
                     return None
@@ -101,16 +105,17 @@ class RSSMonitor:
                 return response.content
                 
             except RequestException as e:
-                logging.error(f"Error fetching {'feed' if is_feed else 'article'} {url}: {e}")
+                logger.error(f"Error fetching {'feed' if is_feed else 'article'} {url}: {e}")
                 if attempt < self.max_retries - 1:
                     continue
                 return None
             except Exception as e:
-                logging.error(f"Unexpected error fetching {'feed' if is_feed else 'article'} {url}: {e}")
+                logger.error(f"Unexpected error fetching {'feed' if is_feed else 'article'} {url}: {e}")
                 if attempt < self.max_retries - 1:
                     continue
                 return None
         
+        logger.error(f"Failed to fetch {url} after {self.max_retries} attempts")
         return None
     
     def _fetch_feed(self, url: str) -> Optional[feedparser.FeedParserDict]:
@@ -129,7 +134,7 @@ class RSSMonitor:
             
         feed_data = feedparser.parse(content)
         if feed_data.bozo:  # Feed parsing error
-            logging.error(f"Error parsing feed {url}: {feed_data.bozo_exception}")
+            logger.error(f"Error parsing feed {url}: {feed_data.bozo_exception}")
             return None
             
         return feed_data
@@ -199,67 +204,77 @@ class RSSMonitor:
             is_article_page (bool): Whether this is a full article page (affects content extraction)
             
         Returns:
-            List[str]: List of paragraphs
+            List[str]: List of extracted paragraphs
         """
         paragraphs = []
-        min_length = self.config.get('rss_min_paragraph_length', 20)
-        content_classes = self.config.get('rss_content_classes', ['entry-content', 'post-content', 'article-content'])
         
-        # For article pages, try to find the main article container first
-        if is_article_page:
-            main_content = None
-            for container in soup.find_all(['article', 'main', 'div'], class_=content_classes):
-                if container.find_all(['p', 'div']):
-                    main_content = container
-                    break
-            
+        # Find the main content area
+        content_classes = self.config.get('rss_content_classes', [
+            'entry-content',
+            'post-content',
+            'article-content',
+            'content',
+            'post',
+            'article',
+            'entry',
+            'description',
+            'summary',
+            'text'
+        ])
+        
+        # Try to find the main content area
+        main_content = None
+        for class_name in content_classes:
+            main_content = soup.find(class_=class_name)
             if main_content:
-                soup = main_content
+                break
         
-        # First try to find paragraphs in article content
-        for p in soup.find_all(['p', 'div', 'article', 'span'], class_=content_classes):
-            text = p.get_text().strip()
-            if text and len(text) > min_length:  # Only include substantial paragraphs
-                paragraphs.append(text)
+        # If no main content area found, try to find the article body
+        if not main_content:
+            main_content = soup.find('article') or soup.find('main') or soup.find('body')
         
-        # If no paragraphs found, try all paragraphs
-        if not paragraphs:
-            for p in soup.find_all(['p', 'div', 'article', 'span']):
+        if main_content:
+            # Remove unwanted elements
+            for element in main_content.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+                element.decompose()
+            
+            # Extract paragraphs
+            for p in main_content.find_all('p'):
                 text = p.get_text().strip()
-                if text and len(text) > min_length:  # Only include substantial paragraphs
+                if text and len(text) >= self.config.get('rss_min_paragraph_length', 20):
                     paragraphs.append(text)
         
-        # If still no paragraphs, try to extract from raw text
+        # If no paragraphs found, try a more general approach
         if not paragraphs:
-            text = soup.get_text().strip()
-            if text:
-                # Split text into paragraphs by newlines and periods
-                raw_paragraphs = []
-                for p in text.split('\n'):
-                    p = p.strip()
-                    if p:
-                        # Split by periods if the text is long
-                        if len(p) > 150:
-                            sentences = [s.strip() + '.' for s in p.split('.') if s.strip()]
-                            raw_paragraphs.extend(sentences)
-                        else:
-                            raw_paragraphs.append(p)
-                
-                paragraphs = [p for p in raw_paragraphs if len(p) > min_length]
+            for p in soup.find_all('p'):
+                text = p.get_text().strip()
+                if text and len(text) >= self.config.get('rss_min_paragraph_length', 20):
+                    paragraphs.append(text)
         
         # Clean up paragraphs
         cleaned_paragraphs = []
         for p in paragraphs:
             # Remove any remaining HTML tags
             p = BeautifulSoup(p, 'html.parser').get_text()
-            # Remove any remaining quotes and special characters
-            p = p.replace('"', '').replace('"', '').replace('"', '')
-            p = p.replace('​', '')  # Remove zero-width space
-            # Remove any text that looks like a footer
-            if not any(x in p.lower() for x in ['first appeared on', 'the post']):
-                p = p.strip()
-                if p and len(p) > min_length:
-                    cleaned_paragraphs.append(p)
+            
+            # Remove any text that looks like a footer or header
+            if not any(x in p.lower() for x in [
+                'first appeared on',
+                'the post',
+                'all rights reserved',
+                'copyright',
+                'follow us',
+                'subscribe',
+                'newsletter',
+                'advertisement',
+                'sponsored',
+                'related articles',
+                'share this',
+                'comments',
+                'login',
+                'register'
+            ]):
+                cleaned_paragraphs.append(p)
         
         return cleaned_paragraphs
     
@@ -328,7 +343,7 @@ class RSSMonitor:
         content_lower = content.lower()
         for indicator in paywall_indicators:
             if indicator in content_lower:
-                logging.info(f"Paywall detected in {url} using indicator: {indicator}")
+                logger.info(f"Paywall detected in {url} using indicator: {indicator}")
                 return True
         
         # Check for common paywall class names and IDs
@@ -338,12 +353,12 @@ class RSSMonitor:
         
         for element in soup.find_all(class_=paywall_classes):
             if element.get_text().strip():
-                logging.info(f"Paywall detected in {url} using class: {element.get('class')}")
+                logger.info(f"Paywall detected in {url} using class: {element.get('class')}")
                 return True
         
         for element in soup.find_all(id=paywall_ids):
             if element.get_text().strip():
-                logging.info(f"Paywall detected in {url} using ID: {element.get('id')}")
+                logger.info(f"Paywall detected in {url} using ID: {element.get('id')}")
                 return True
         
         return False
@@ -363,7 +378,7 @@ class RSSMonitor:
         # Check if feed should be flagged as paywalled
         recent_hits = self.db.get_recent_paywall_hits(feed_id, days=7)
         if recent_hits >= 5:
-            logging.warning(f"Feed {feed_url} has hit paywall {recent_hits} times in the last week")
+            logger.warning(f"Feed {feed_url} has hit paywall {recent_hits} times in the last week")
             print(f"\nWARNING: Feed {feed_url} has hit paywalls {recent_hits} times in the last week.")
             print("This feed may be paywalled. Would you like to:")
             print("1. Keep monitoring this feed")
@@ -427,37 +442,102 @@ class RSSMonitor:
             if author_tag:
                 author = author_tag.get_text().strip()
             
-            # Extract paragraphs
-            paragraphs = self._extract_paragraphs(soup, is_article_page=True)
+            # Find the main content area
+            content_classes = self.config.get('rss_content_classes', [
+                'entry-content',
+                'post-content',
+                'article-content',
+                'content',
+                'post',
+                'article',
+                'entry',
+                'description',
+                'summary',
+                'text'
+            ])
+            
+            # Try to find the main content area
+            main_content = None
+            for class_name in content_classes:
+                main_content = soup.find(class_=class_name)
+                if main_content:
+                    break
+            
+            # If no main content area found, try to find the article body
+            if not main_content:
+                main_content = soup.find('article') or soup.find('main') or soup.find('body')
+            
+            # Extract and clean paragraphs
+            paragraphs = []
+            if main_content:
+                # Remove unwanted elements
+                for element in main_content.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'div']):
+                    if any(x in element.get('class', []) for x in ['social-share', 'related-posts', 'comments', 'advertisement']):
+                        element.decompose()
+                
+                # Extract paragraphs
+                for p in main_content.find_all('p'):
+                    text = p.get_text().strip()
+                    if text and len(text) >= self.config.get('rss_min_paragraph_length', 20):
+                        # Clean up the text
+                        text = BeautifulSoup(text, 'html.parser').get_text()
+                        text = text.replace('\n', ' ').replace('\r', '')
+                        text = ' '.join(text.split())  # Normalize whitespace
+                        
+                        # Skip if it looks like a footer or header
+                        if not any(x in text.lower() for x in [
+                            'first appeared on',
+                            'the post',
+                            'all rights reserved',
+                            'copyright',
+                            'follow us',
+                            'subscribe',
+                            'newsletter',
+                            'advertisement',
+                            'sponsored',
+                            'related articles',
+                            'share this',
+                            'comments',
+                            'login',
+                            'register',
+                            'follow us everywhere',
+                            'bulgarianmilitary.com',
+                            'manifesto',
+                            'ethical principles'
+                        ]):
+                            paragraphs.append(text)
+            
+            # Limit to first 5 paragraphs
+            paragraphs = paragraphs[:5]
+            
+            # Combine paragraphs into content
+            content = '\n\n'.join(paragraphs)
             
             return {
                 'title': title,
                 'author': author,
                 'paragraphs': paragraphs,
-                'content': content.decode('utf-8') if isinstance(content, bytes) else content
+                'content': content
             }
             
         except Exception as e:
-            logging.error(f"Error extracting content from article {url}: {e}")
+            logger.error(f"Error extracting content from article {url}: {e}")
             return None
     
-    def get_entries(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    def get_entries(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
-        Fetch and parse entries from all configured RSS feeds.
+        Get entries from active feeds.
         
         Args:
-            force_refresh (bool): Whether to force refresh the cache
-        
-        Returns:
-            List[Dict[str, Any]]: List of article entries with their metadata
-        """
-        if self._cached_entries and not force_refresh:
-            return self._cached_entries
+            limit (int, optional): Maximum number of entries to return
             
-        all_entries = []
-        active_feeds = self.db.get_active_feeds()
+        Returns:
+            List[Dict[str, Any]]: List of feed entries
+        """
+        entries = []
+        feeds = self.db.get_active_feeds()
         
-        for feed in active_feeds:
+        for feed in feeds:
             try:
                 feed_data = self._fetch_feed(feed['url'])
                 if not feed_data:
@@ -470,84 +550,39 @@ class RSSMonitor:
                         article_data = {
                             'title': entry.get('title', ''),
                             'link': entry.get('link', ''),
-                            'published': entry.get('published', ''),
+                            'published_date': entry.get('published', ''),
                             'author': entry.get('author', ''),
                             'summary': entry.get('summary', ''),
                             'tags': [tag.get('term', '') for tag in entry.get('tags', [])],
                             'source_feed': feed['url'],
-                            'feed_title': feed_data.feed.get('title', feed['title']),
-                            'feed_link': feed_data.feed.get('link', ''),
-                            'entry_id': entry.get('id', entry.get('link', '')),
                             'feed_id': feed['id']
                         }
                         
                         # Convert published date to ISO format if available
-                        if article_data['published']:
+                        if article_data['published_date']:
                             try:
                                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                                     parsed_date = datetime.fromtimestamp(mktime(entry.published_parsed))
-                                    article_data['published'] = parsed_date.isoformat()
+                                    article_data['published_date'] = parsed_date.isoformat()
                             except Exception as e:
-                                logging.warning(f"Could not parse date '{article_data['published']}': {e}")
+                                logger.warning(f"Could not parse date '{article_data['published_date']}': {e}")
                         
-                        # Extract content
-                        content = None
-                        if hasattr(entry, 'content'):
-                            content = entry.content[0].value
-                        elif hasattr(entry, 'description'):
-                            content = entry.description
-                        elif hasattr(entry, 'summary'):
-                            content = entry.summary
-                        
-                        # Process content with BeautifulSoup
-                        if content:
-                            content = self._clean_content(content)
-                            soup = BeautifulSoup(content, 'html.parser')
-                            
-                            # Extract paragraphs
-                            article_data['paragraphs'] = self._extract_paragraphs(soup)
-                            article_data['content'] = content
-                            
-                            # If no substantial paragraphs found, try fetching from the article URL
-                            if not article_data['paragraphs'] and article_data['link']:
-                                logging.info(f"No content found in feed, fetching from article URL: {article_data['link']}")
-                                article_content = self._extract_article_content(article_data['link'], feed_id=feed['id'], feed_url=feed['url'])
-                                if article_content:
-                                    article_data['paragraphs'] = article_content['paragraphs']
-                                    article_data['content'] = article_content['content']
-                                    # Update title and author if not already present
-                                    if not article_data['title'] and article_content['title']:
-                                        article_data['title'] = article_content['title']
-                                    if not article_data['author'] and article_content['author']:
-                                        article_data['author'] = article_content['author']
-                        else:
-                            article_data['content'] = ''
-                            article_data['paragraphs'] = []
-                            # Try fetching from the article URL as a fallback
-                            if article_data['link']:
-                                logging.info(f"No content in feed, fetching from article URL: {article_data['link']}")
-                                article_content = self._extract_article_content(article_data['link'], feed_id=feed['id'], feed_url=feed['url'])
-                                if article_content:
-                                    article_data['paragraphs'] = article_content['paragraphs']
-                                    article_data['content'] = article_content['content']
-                                    # Update title and author if not already present
-                                    if not article_data['title'] and article_content['title']:
-                                        article_data['title'] = article_content['title']
-                                    if not article_data['author'] and article_content['author']:
-                                        article_data['author'] = article_content['author']
-                        
-                        all_entries.append(article_data)
+                        entries.append(article_data)
                         
                     except Exception as e:
-                        logging.error(f"Error processing entry from feed {feed['url']}: {e}")
+                        logger.error(f"Error processing entry from feed {feed['url']}: {e}")
                         continue
                     
             except Exception as e:
-                logging.error(f"Error processing feed {feed['url']}: {e}")
+                logger.error(f"Error fetching feed {feed['url']}: {e}")
                 continue
         
-        self._cached_entries = all_entries
-        return all_entries
+        # Sort entries by date (newest first) and apply limit
+        entries.sort(key=lambda x: x.get('published_date', ''), reverse=True)
+        if limit:
+            entries = entries[:limit]
+        
+        return entries
     
     def get_article_links(self) -> List[str]:
         """
@@ -572,17 +607,21 @@ class RSSMonitor:
         entries = self.get_entries()
         for entry in entries:
             if entry['link'] == link:
+                # Extract article content
+                content = self._extract_article_content(link)
+                if not content:
+                    return None
+                    
                 return {
+                    'url': link,
                     'title': entry['title'],
-                    'link': entry['link'],
-                    'published': entry['published'],
+                    'content': content['content'],
                     'author': entry['author'],
-                    'summary': entry['summary'],
+                    'published': entry['published_date'],
                     'tags': entry['tags'],
-                    'paragraphs': entry['paragraphs'],
-                    'content': entry['content'],
+                    'processed': False,
                     'source_feed': entry['source_feed'],
-                    'feed_title': entry['feed_title']
+                    'feed_id': entry['feed_id']
                 }
         return None
     
@@ -618,4 +657,90 @@ class RSSMonitor:
         Returns:
             bool: True if successful, False otherwise
         """
-        return self.db.update_feed_status(feed_id, is_active) 
+        return self.db.update_feed_status(feed_id, is_active)
+    
+    def get_articles(self, limit: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Get articles from RSS feeds.
+        
+        Args:
+            limit (int, optional): Maximum number of articles to return
+            
+        Returns:
+            Dict[str, Dict[str, Any]]: Dictionary of articles by URL
+        """
+        articles = {}
+        
+        # Get feeds from database
+        feeds = self.db.list_feeds()
+        if not feeds:
+            logger.warning("No feeds found in database")
+            return articles
+            
+        for feed in feeds:
+            try:
+                feed_url = feed['url']
+                logger.info(f"Fetching RSS feed: {feed} (attempt 1/{self.max_retries})")
+                
+                # Fetch feed content
+                feed_content = self._fetch_url(feed_url, is_feed=True)
+                if not feed_content:
+                    continue
+                    
+                # Parse feed
+                feed = feedparser.parse(feed_content)
+                if feed.bozo:  # Feed parsing error
+                    logger.error(f"Error parsing feed {feed_url}: {feed.bozo_exception}")
+                    continue
+                    
+                # Process entries
+                entries = feed.entries[:self.max_entries]
+                if limit:
+                    entries = entries[:limit]
+                    
+                for entry in entries:
+                    try:
+                        url = entry.get('link')
+                        if not url:
+                            continue
+                            
+                        # Skip if already processed
+                        if url in articles:
+                            continue
+                            
+                        # Extract article content
+                        content = self._extract_article_content(url)
+                        if not content:
+                            continue
+                            
+                        # Add to articles dictionary
+                        articles[url] = content
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing entry from feed {feed_url}: {str(e)}")
+                        continue
+                        
+            except Exception as e:
+                logger.error(f"Error processing feed {feed_url}: {str(e)}")
+                continue
+                
+        return articles
+    
+    def save_articles(self, articles: Dict[str, Dict[str, Any]]) -> None:
+        """
+        Save processed articles to the database.
+        
+        Args:
+            articles (Dict[str, Dict[str, Any]]): Dictionary of articles to save
+        """
+        try:
+            saved_count = 0
+            for url, article in articles.items():
+                if article.get('processed'):
+                    if self.db.save_article(article):
+                        saved_count += 1
+                    
+            logger.info(f"Saved {saved_count} processed articles to database")
+            
+        except Exception as e:
+            logger.error(f"Error saving articles to database: {e}") 

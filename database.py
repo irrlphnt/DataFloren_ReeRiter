@@ -4,11 +4,12 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
 import re
+from logger import database_logger as logger
 
 class Database:
     """Database manager for storing RSS feeds and processed entries."""
     
-    def __init__(self, db_path: str = "articles.db"):
+    def __init__(self, db_path: str = "feeds.db"):
         """
         Initialize the database manager.
         
@@ -17,79 +18,114 @@ class Database:
         """
         self.db_path = db_path
         self._init_db()
+        logger.info(f"Database initialized at {db_path}")
+    
+    def _get_connection(self):
+        """Get a database connection with a timeout."""
+        return sqlite3.connect(self.db_path, timeout=30)
     
     def _init_db(self) -> None:
         """Initialize the database tables."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Create feeds table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS feeds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT UNIQUE NOT NULL,
-                name TEXT,
-                is_active BOOLEAN DEFAULT 1,
-                last_fetch TIMESTAMP,
-                paywall_hits INTEGER DEFAULT 0,
-                is_paywalled BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Create processed_entries table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS processed_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                feed_id INTEGER,
-                entry_id TEXT UNIQUE NOT NULL,
-                title TEXT,
-                link TEXT,
-                published_date TIMESTAMP,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (feed_id) REFERENCES feeds (id)
-            )
-        ''')
-        
-        # Create paywall_hits table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS paywall_hits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                feed_id INTEGER,
-                url TEXT NOT NULL,
-                hit_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (feed_id) REFERENCES feeds (id)
-            )
-        ''')
-        
-        # Create tags table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS tags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                normalized_name TEXT NOT NULL,
-                usage_count INTEGER DEFAULT 0,
-                last_used TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                thematic_prompt TEXT,
-                is_active BOOLEAN DEFAULT 1
-            )
-        ''')
-        
-        # Create article_tags table (many-to-many relationship)
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS article_tags (
-                article_url TEXT NOT NULL,
-                tag_id INTEGER NOT NULL,
-                source TEXT NOT NULL,  -- 'rss', 'scrape', 'ai'
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (article_url, tag_id),
-                FOREIGN KEY (tag_id) REFERENCES tags (id)
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Create feeds table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS feeds (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        url TEXT UNIQUE NOT NULL,
+                        name TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        is_paywalled INTEGER DEFAULT 0,
+                        last_fetch TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        paywall_hits INTEGER DEFAULT 0,
+                        last_paywall_hit TEXT
+                    )
+                """)
+                
+                # Create articles table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS articles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        url TEXT UNIQUE NOT NULL,
+                        title TEXT,
+                        content TEXT,
+                        author TEXT,
+                        published TEXT,
+                        processed INTEGER DEFAULT 0,
+                        wordpress_post_id INTEGER,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Create processed_entries table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS processed_entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        feed_id INTEGER NOT NULL,
+                        entry_id TEXT UNIQUE NOT NULL,
+                        title TEXT,
+                        link TEXT,
+                        published_at TEXT,
+                        processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (feed_id) REFERENCES feeds (id)
+                    )
+                """)
+                
+                # Create paywall_hits table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS paywall_hits (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        feed_id INTEGER NOT NULL,
+                        url TEXT NOT NULL,
+                        hit_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (feed_id) REFERENCES feeds (id)
+                    )
+                """)
+                
+                # Create tags table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tags (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT UNIQUE NOT NULL,
+                        normalized_name TEXT UNIQUE NOT NULL,
+                        source TEXT,
+                        usage_count INTEGER DEFAULT 0,
+                        last_used TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        is_active INTEGER DEFAULT 1
+                    )
+                """)
+                
+                # Create article_tags table for many-to-many relationship
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS article_tags (
+                        article_id INTEGER,
+                        tag_id INTEGER,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (article_id, tag_id),
+                        FOREIGN KEY (article_id) REFERENCES articles (id),
+                        FOREIGN KEY (tag_id) REFERENCES tags (id)
+                    )
+                """)
+                
+                # Create thematic_prompts table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS thematic_prompts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tag_name TEXT UNIQUE NOT NULL,
+                        prompt TEXT NOT NULL,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                conn.commit()
+                logger.info("Database tables initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing database: {e}")
+            raise
     
     def add_feed(self, url: str, name: str = None) -> bool:
         """
@@ -102,10 +138,10 @@ class Database:
         Returns:
             bool: True if successful, False otherwise
         """
+        conn = self._get_connection()
+        c = conn.cursor()
+        
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
             # If no name provided, use the URL as the name
             if not name:
                 name = url
@@ -116,7 +152,6 @@ class Database:
             ''', (url, name))
             
             conn.commit()
-            conn.close()
             return True
         except sqlite3.IntegrityError:
             logging.warning(f"Feed URL {url} already exists")
@@ -124,6 +159,8 @@ class Database:
         except Exception as e:
             logging.error(f"Error adding feed {url}: {e}")
             return False
+        finally:
+            conn.close()
     
     def import_feeds_from_csv(self, csv_path: str) -> Dict[str, int]:
         """
@@ -184,8 +221,8 @@ class Database:
         c = conn.cursor()
         
         query = '''
-            SELECT id, url, name, title, is_active, is_paywalled, 
-                   last_fetch, created_at, last_checked, paywall_hits, last_paywall_hit
+            SELECT id, url, name, is_active, is_paywalled, 
+                   last_fetch, created_at, paywall_hits
             FROM feeds
         '''
         
@@ -202,7 +239,7 @@ class Database:
         for row in c.fetchall():
             feed = dict(zip(columns, row))
             # Convert timestamps to ISO format
-            for key in ['last_fetch', 'created_at', 'last_checked', 'last_paywall_hit']:
+            for key in ['last_fetch', 'created_at']:
                 if feed[key]:
                     feed[key] = datetime.fromisoformat(feed[key]).isoformat()
             feeds.append(feed)
@@ -212,22 +249,37 @@ class Database:
     
     def get_active_feeds(self) -> List[Dict[str, Any]]:
         """
-        Get all active RSS feeds from the database.
+        Get all active feeds.
         
         Returns:
-            List[Dict[str, Any]]: List of feed dictionaries
+            List[Dict[str, Any]]: List of active feed information
         """
+        conn = self._get_connection()
+        c = conn.cursor()
+        
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("SELECT id, url, title FROM feeds WHERE is_active = 1")
-            return [
-                {"id": row[0], "url": row[1], "title": row[2]}
-                for row in c.fetchall()
-            ]
-        except Exception as e:
-            logging.error(f"Error getting active feeds: {e}")
-            return []
+            c.execute('''
+                SELECT id, url, name, is_active, is_paywalled, 
+                       last_fetch, created_at, paywall_hits
+                FROM feeds
+                WHERE is_active = 1
+                ORDER BY name
+            ''')
+            
+            columns = [description[0] for description in c.description]
+            feeds = []
+            
+            for row in c.fetchall():
+                feed = dict(zip(columns, row))
+                # Format timestamps for JSON serialization
+                for key in ['last_fetch', 'created_at']:
+                    if feed[key]:
+                        feed[key] = datetime.fromisoformat(feed[key]).isoformat()
+                feeds.append(feed)
+            
+            return feeds
+        finally:
+            conn.close()
     
     def mark_entry_processed(self, feed_id: int, entry_id: str, title: str, 
                            link: str, published_at: Optional[str] = None) -> bool:
@@ -710,6 +762,14 @@ class Database:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             
+            # Get article ID
+            c.execute('SELECT id FROM articles WHERE url = ?', (article_url,))
+            result = c.fetchone()
+            if not result:
+                logger.error(f"Article not found: {article_url}")
+                return False
+            article_id = result[0]
+            
             for tag_name in tag_names:
                 # Add or get tag
                 tag_id = self.add_tag(tag_name, source)
@@ -718,14 +778,56 @@ class Database:
                 
                 # Add article-tag relationship
                 c.execute('''
-                    INSERT OR IGNORE INTO article_tags (article_url, tag_id, source)
+                    INSERT OR IGNORE INTO article_tags (article_id, tag_id, source)
                     VALUES (?, ?, ?)
-                ''', (article_url, tag_id, source))
+                ''', (article_id, tag_id, source))
             
             conn.commit()
             conn.close()
             return True
             
         except Exception as e:
-            logging.error(f"Error adding tags to article {article_url}: {e}")
+            logger.error(f"Error adding tags to article {article_url}: {e}")
+            return False
+    
+    def save_article(self, article_data: Dict[str, Any]) -> bool:
+        """
+        Save an article to the database.
+        
+        Args:
+            article_data (Dict[str, Any]): Article data including url, title, content, etc.
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            # Extract article data
+            url = article_data.get('url')
+            title = article_data.get('title')
+            content = article_data.get('content')
+            author = article_data.get('author')
+            published = article_data.get('published')
+            processed = article_data.get('processed', 0)
+            wordpress_post_id = article_data.get('wordpress_post_id')
+            
+            # Save article
+            c.execute('''
+                INSERT OR REPLACE INTO articles 
+                (url, title, content, author, published, processed, wordpress_post_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (url, title, content, author, published, processed, wordpress_post_id))
+            
+            # Save tags if present
+            if 'tags' in article_data and article_data['tags']:
+                self.add_article_tags(url, article_data['tags'], source='rss')
+            
+            conn.commit()
+            conn.close()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving article {article_data.get('url')}: {e}")
             return False 
