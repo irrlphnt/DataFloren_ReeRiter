@@ -4,17 +4,19 @@ import json
 import os
 from typing import Optional, Dict, Any, List
 from logger import lm_studio_logger as logger
+from datetime import datetime
 
 class LMStudio:
     """Handles interactions with a local LM Studio server."""
     
-    def __init__(self, url: str = "http://localhost:1234/v1", model: str = "mistral-7b-instruct-v0.3"):
+    def __init__(self, url: str = "http://localhost:1234/v1", model: str = "mistral-7b-instruct-v0.3", test_connection: bool = True):
         """
         Initialize the LM Studio client.
         
         Args:
             url (str): The URL of the LM Studio server
             model (str): The model to use
+            test_connection (bool): Whether to test the connection on initialization
         """
         self.url = url.rstrip('/')
         self.model = model
@@ -27,8 +29,9 @@ class LMStudio:
         self.cache_file = os.path.join(self.cache_dir, "rewriter_cache.json")
         self.cache = self._load_cache()
         
-        # Test connection
-        self.test_connection()
+        # Test connection if requested
+        if test_connection:
+            self.test_connection()
     
     def _load_cache(self) -> Dict[str, Any]:
         """Load the cache from file if it exists."""
@@ -140,9 +143,22 @@ class LMStudio:
         Returns:
             Optional[Dict[str, Any]]: Rewritten article data or None if failed
         """
-        # Skip if article title is missing
-        if not article_data or not article_data.get('title'):
-            logger.warning("Cannot rewrite article: Missing title or article data")
+        # Skip if article data is missing or invalid
+        if not article_data:
+            logger.warning("Cannot rewrite article: Missing article data")
+            return None
+            
+        # Check required fields
+        if not article_data.get('title'):
+            logger.warning("Cannot rewrite article: Missing title")
+            return None
+            
+        if not article_data.get('content'):
+            logger.warning("Cannot rewrite article: Missing content")
+            return None
+            
+        if not article_data.get('url'):
+            logger.warning("Cannot rewrite article: Missing URL")
             return None
         
         # Check if this article is already in the cache
@@ -155,6 +171,9 @@ class LMStudio:
         
         # Construct the prompt for article rewriting
         prompt = self._construct_rewrite_prompt(article_data, style, tone)
+        if not prompt:
+            logger.warning("Cannot rewrite article: Failed to construct prompt")
+            return None
         
         try:
             # Generate rewritten content
@@ -164,6 +183,17 @@ class LMStudio:
             
             # Parse the rewritten content
             rewritten_article = self._parse_rewritten_content(rewritten_content, article_data)
+            if not rewritten_article:
+                logger.warning("Cannot rewrite article: Failed to parse rewritten content")
+                return None
+            
+            # Add AI metadata with model name
+            rewritten_article['ai_metadata'] = {
+                'generated_by': f"LMStudio ({self.model})",
+                'generation_date': datetime.now().isoformat(),
+                'original_source': article_data.get('url', ''),
+                'original_title': article_data.get('title', '')
+            }
             
             # Save to cache
             self.cache[cache_key] = rewritten_article
@@ -189,8 +219,11 @@ class LMStudio:
         """
         # Gather the original content
         title = article_data.get('title', '')
-        paragraphs = article_data.get('paragraphs', [])
-        content = "\n\n".join(paragraphs)
+        content = article_data.get('content', '')
+        
+        # If content is empty, return None
+        if not content:
+            return None
         
         # Construct the prompt
         prompt = f"""
@@ -198,75 +231,64 @@ You are a professional article rewriter. Rewrite the following article in a {sty
 Maintain the key information and meaning, but use different wording and structure.
 Format the response with a clear title and paragraphs.
 
-Original Title: {title}
+Title: {title}
 
-Original Content:
+Content:
 {content}
 
-Please format your response as follows:
-TITLE: [Rewritten Title]
+Please provide the rewritten article in the following format:
+TITLE: [Your rewritten title]
 
-[Rewritten content organized in paragraphs]
-        """
-        
+[Your rewritten paragraphs, each separated by a blank line]
+"""
         return prompt
     
-    def _parse_rewritten_content(self, rewritten_content: str, original_article: Dict[str, Any]) -> Dict[str, Any]:
+    def _parse_rewritten_content(self, content: str, original_article: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Parse the rewritten content from the LM Studio API response.
+        Parse the rewritten content into a structured article format.
         
         Args:
-            rewritten_content (str): The rewritten content from the API
+            content (str): The raw rewritten content
             original_article (dict): The original article data
             
         Returns:
-            Dict[str, Any]: A dictionary containing the rewritten article data
+            Dict[str, Any]: The parsed article data
         """
-        # Initialize with structure similar to original article
-        rewritten_article = {
-            'title': original_article.get('title', ''),  # Default to original
-            'paragraphs': [],
-            'author': original_article.get('author', ''),
-            'date': original_article.get('date', ''),
-            'images': original_article.get('images', []),  # Preserve original images
-            'original_url': original_article.get('original_url', '')
-        }
-        
-        # Extract title and content from the rewritten text
-        lines = rewritten_content.split('\n')
-        content_started = False
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+        try:
+            # Split content into lines
+            lines = content.strip().split('\n')
             
-            # Extract title
-            if line.startswith('TITLE:'):
-                rewritten_article['title'] = line.replace('TITLE:', '').strip()
-            elif 'TITLE:' in line:  # Handle case where format might be different
-                parts = line.split('TITLE:')
-                if len(parts) > 1:
-                    rewritten_article['title'] = parts[1].strip()
-            # For paragraphs, we skip any non-content lines at the beginning
-            elif not content_started:
-                # If we've processed the title and encountered a substantial text that's not an instruction
-                if (rewritten_article['title'] and 
-                    len(line) > 30 and 
-                    not line.startswith('#') and 
-                    not line.startswith('TITLE:')):
-                    content_started = True
-                    rewritten_article['paragraphs'].append(line)
-            else:
-                # Add to paragraphs if it's not a short line
-                if len(line) > 10:
-                    rewritten_article['paragraphs'].append(line)
-        
-        # If no title was extracted, use the original
-        if not rewritten_article['title'] or rewritten_article['title'] == 'Rewritten Title':
-            rewritten_article['title'] = original_article.get('title', '')
-        
-        return rewritten_article
+            # Extract title (should start with "TITLE:")
+            title = None
+            paragraphs = []
+            
+            for line in lines:
+                if line.startswith('TITLE:'):
+                    title = line[6:].strip()
+                elif line.strip():
+                    paragraphs.append(line.strip())
+            
+            # If no title was found, use the original title
+            if not title:
+                title = original_article.get('title', '')
+            
+            # Create the rewritten article
+            rewritten_article = {
+                'title': title,
+                'paragraphs': paragraphs,
+                'url': original_article.get('url', ''),
+                'ai_metadata': {
+                    'generated_by': 'lm_studio',
+                    'generation_date': datetime.now().isoformat(),
+                    'original_source': original_article.get('url', '')
+                }
+            }
+            
+            return rewritten_article
+            
+        except Exception as e:
+            logger.error(f"Error parsing rewritten content: {e}")
+            return None
     
     def _split_prompt(self, prompt: str, max_chunk_size: int = 4000) -> List[str]:
         """
