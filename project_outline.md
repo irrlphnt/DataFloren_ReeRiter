@@ -1,182 +1,191 @@
-# Article Monitor & Rewriter - Project Outline
+# DataFloren ReeRiter Project Outline
 
-## Project Overview
+## Current State
 
-The Article Monitor & Rewriter is a comprehensive tool that monitors websites and RSS feeds for new articles, rewrites them using AI, and posts them to WordPress. The tool includes a web interface for easy management and monitoring.
+### Implemented Features
+1. RSS Feed Management
+   - Feed addition and removal
+   - Feed listing
+   - CSV import/export functionality
+   - Feed status tracking (active/inactive)
+   - Paywall detection and tracking
 
-## Core Components
+2. Article Processing
+   - RSS feed monitoring
+   - Article extraction and parsing
+   - Paywall detection
+   - Article storage in database
+   - Processed entry tracking
 
-### 1. Website Monitor
-- Monitors specified websites for new articles
-- Extracts external links from main content areas
-- Excludes tag cloud and category pages
-- Configurable link limits and monitoring intervals
-- Error handling and retry mechanisms
+3. AI Integration
+   - LMStudio API integration
+   - Article rewriting
+   - Tag generation
+   - Thematic prompt support
+   - Model name tracking in AI metadata
 
-### 2. RSS Feed Monitor
-- Supports multiple RSS feed sources
-- Configurable entry limits per feed
-- Feed management through web interface
-- Feed status tracking and statistics
-- Duplicate entry prevention
-
-### 3. Article Scraper
-- Extracts article content, title, and metadata
-- Handles images and media content
-- Preserves original author and date information
-- Supports both website and RSS content
-- Error handling for malformed content
-
-### 4. AI Article Rewriter
-- Integration with LM Studio (default)
-- OpenAI API support as alternative
-- Configurable model selection
-- Content preservation and formatting
-- AI disclosure metadata
-- Error handling and retry logic
-
-### 5. WordPress Integration
-- REST API integration
-- Article posting with metadata
-- Image upload support
-- Category and tag management
-- Post status control
-- Error handling and recovery
-
-### 6. Web Interface
-- Dashboard with processing status
-- RSS feed management
-- Article monitoring and filtering
-- System logs with real-time updates
-- Processing control
-- Error notifications
-
-### 7. Error Handling & Recovery
-- State tracking for each processing stage
-- Automatic recovery from failures
-- Detailed error logging
-- Error notifications in web interface
-- Screenshot capture on errors
-- Processing state persistence
-
-### 8. Configuration & Logging
-- JSON-based configuration
-- Environment variable support
-- Command-line arguments
-- Comprehensive logging system
-- Log filtering and export
-- Real-time log updates
-
-## Data Flow
-
-1. Monitoring Stage
-   - Website scraping or RSS feed monitoring
-   - Link extraction and validation
-   - Duplicate checking
-
-2. Scraping Stage
-   - Article content extraction
-   - Metadata collection
-   - Image processing
-
-3. Rewriting Stage
-   - AI model integration
-   - Content rewriting
-   - AI disclosure addition
-
-4. Posting Stage
-   - WordPress API integration
+4. WordPress Integration
+   - REST API connection
    - Article posting
-   - Image upload
-   - Status tracking
+   - Tag management
+   - AI disclosure support
+   - Draft/publish status control
 
-## File Structure
+5. Database Management
+   - SQLite database implementation
+   - Tables for feeds, articles, tags
+   - Processed entries tracking
+   - Paywall hit tracking
+   - Database connection pooling
 
+### Current Architecture
 ```
-article-monitor-rewriter/
-├── main.py                 # Main script
-├── article_scraper.py      # Article scraping functionality
-├── article_rewriter.py     # AI rewriting functionality
-├── wordpress_poster.py     # WordPress integration
-├── rss_monitor.py          # RSS feed monitoring
-├── config.json            # Configuration file
+DataFloren_ReeRiter/
+├── main.py                # Main application entry point
+├── lm_studio.py           # LM Studio integration
+├── rss_monitor.py         # RSS feed monitoring
+├── wordpress_poster.py    # WordPress integration
+├── tag_manager.py         # Tag generation and management
+├── database.py            # Database operations
+├── logger.py              # Logging configuration
+├── config.json            # Application configuration
 ├── requirements.txt       # Python dependencies
-├── manage.py             # Django management script
-├── article_monitor_web/   # Django project settings
-└── monitor/              # Django app
-    ├── models.py         # Database models
-    ├── views.py          # View controllers
-    ├── urls.py           # URL routing
-    ├── forms.py          # Form definitions
-    └── templates/        # HTML templates
+└── feeds.db              # SQLite database
 ```
 
-## Configuration Options
+## Future Development Plans
 
-### Command Line Arguments
-- `--limit`: Number of links to process
-- `--use-openai`: Use OpenAI API instead of LM Studio
-- `--api-key`: OpenAI API key
-- `--use-rss`: Enable RSS feed monitoring
-- `--rss-feeds`: List of RSS feed URLs
-- `--rss-max-entries`: Maximum entries per feed
-- `--skip-rewrite`: Skip article rewriting
-- `--skip-wordpress`: Skip WordPress posting
-- `--wp-status`: WordPress post status
-- `--wp-category`: Default WordPress category
+### Phase 1: Enhanced Feed Management
+1. Feed Validation
+   - RSS feed format validation
+   - Feed health monitoring
+   - Automatic feed testing
+   - Feed update frequency tracking
 
-### Environment Variables
-- `WP_URL`: WordPress site URL
-- `WP_USERNAME`: WordPress username
-- `WP_PASSWORD`: WordPress password
-- `OPENAI_API_KEY`: OpenAI API key
+2. Feed Organization
+   - Feed categories/tags
+   - Feed grouping
+   - Feed priority levels
+   - Feed scheduling
 
-## AI Disclosure Features
+### Phase 2: Improved Article Processing
+1. Content Enhancement
+   - Image handling and optimization
+   - Link validation and management
+   - Content formatting improvements
+   - Metadata extraction
 
-- Model information tracking
-- Generation date and time
-- Original source attribution
-- Clear disclosure statement
-- Metadata preservation
-- WordPress integration
+2. Quality Control
+   - Content quality checks
+   - Duplicate detection
+   - Source verification
+   - Content relevance scoring
 
-## Error Recovery Features
+### Phase 3: Advanced AI Features
+1. Content Generation
+   - Multiple AI model support
+   - Content style customization
+   - Language translation
+   - Content summarization
 
-- Processing state tracking
-- Automatic stage recovery
-- Failed link handling
-- Error logging and reporting
-- Screenshot capture
-- Web interface notifications
+2. Tag System Enhancement
+   - Hierarchical tag structure
+   - Tag relationships
+   - Tag suggestions
+   - Tag analytics
 
-## Next Steps
+### Phase 4: WordPress Integration Improvements
+1. Content Management
+   - Category management
+   - Custom fields support
+   - Media handling
+   - Content scheduling
 
-1. Web Interface Enhancements
-   - User authentication
-   - Role-based access control
-   - Customizable dashboard
-   - Advanced filtering options
+2. Site Integration
+   - Multiple site support
+   - Site-specific settings
+   - Content syndication
+   - Analytics integration
 
-2. Processing Improvements
-   - Scheduled processing
-   - Batch processing optimization
-   - Parallel processing support
-   - Advanced error recovery
+### Phase 5: Monitoring and Analytics
+1. Performance Tracking
+   - Processing speed metrics
+   - Error rate monitoring
+   - Resource usage tracking
+   - System health checks
 
-3. Integration Features
-   - Additional AI model support
-   - Multiple WordPress site support
-   - API rate limiting
-   - Webhook notifications
+2. Content Analytics
+   - Article performance tracking
+   - Tag effectiveness analysis
+   - Feed performance metrics
+   - User engagement tracking
 
-4. Monitoring & Analytics
-   - Processing statistics
-   - Performance metrics
-   - Success rate tracking
-   - Usage analytics
+## Technical Debt and Maintenance
 
-5. Documentation & Deployment
+### Current Focus
+1. Database Optimization
+   - Query performance improvements
+   - Index optimization
+   - Connection management
+   - Data cleanup routines
+
+2. Error Handling
+   - Comprehensive error logging
+   - Recovery procedures
+   - User notifications
+   - System state preservation
+
+### Future Improvements
+1. Code Quality
+   - Unit test coverage
+   - Integration tests
+   - Code documentation
+   - Type hints
+
+2. Performance
+   - Caching implementation
+   - Async operations
+   - Resource optimization
+   - Load balancing
+
+## Documentation
+
+### Current Status
+- Basic README
+- Code comments
+- Configuration guide
+- Command-line help
+
+### Planned Documentation
+1. User Guides
+   - Installation guide
+   - Configuration guide
+   - Usage examples
+   - Troubleshooting guide
+
+2. Technical Documentation
    - API documentation
-   - Deployment guides
-   - Docker support
-   - CI/CD integration 
+   - Database schema
+   - Architecture diagrams
+   - Development guide
+
+## Deployment
+
+### Current Setup
+- Local development
+- Manual deployment
+- Basic configuration
+- Simple database setup
+
+### Future Plans
+1. Deployment Options
+   - Docker containerization
+   - Cloud deployment
+   - Automated deployment
+   - Environment management
+
+2. Monitoring
+   - Health checks
+   - Performance monitoring
+   - Error tracking
+   - Usage analytics 
