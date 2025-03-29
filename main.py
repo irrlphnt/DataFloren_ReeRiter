@@ -14,7 +14,7 @@ import json
 import os
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
 import traceback
@@ -52,11 +52,8 @@ def parse_args():
     parser.add_argument('--skip-rewrite', action='store_true', help='Skip article rewriting')
     parser.add_argument('--skip-wordpress', action='store_true', help='Skip WordPress posting')
     parser.add_argument('--add-feed', type=str, help='Add a new RSS feed')
-    parser.add_argument('--remove-feed', type=str, help='Remove an RSS feed')
+    parser.add_argument('--remove-feed', type=int, help='Remove an RSS feed by its ID')
     parser.add_argument('--list-feeds', action='store_true', help='List all configured feeds')
-    parser.add_argument('--add-thematic-prompt', action='store_true', help='Add a thematic prompt')
-    parser.add_argument('--tag-name', type=str, help='Tag name for thematic prompt')
-    parser.add_argument('--prompt', type=str, help='Prompt text for thematic prompt')
     return parser.parse_args()
 
 # Config variables
@@ -204,8 +201,8 @@ def monitor_website(driver):
         for article in main_content.find_all(['article', 'div'], class_=['post', 'entry', 'article']):
             link = article.find('a', href=True)
             if link:
-                # Convert relative URLs to absolute URLs
-                absolute_url = urljoin(website_url, link['href'])
+        # Convert relative URLs to absolute URLs
+        absolute_url = urljoin(website_url, link['href'])
                 # Only add external links that are not navigation or tag-related
                 if (not absolute_url.startswith(website_url) or 
                     not any(tag in absolute_url.lower() for tag in ['/tag/', '/category/', '/author/', '#', 'page'])):
@@ -317,7 +314,7 @@ def process_links(driver: Optional[webdriver.Chrome], links: List[str], rss_moni
                 # For website scraping, use the existing process
                 driver.set_page_load_timeout(10)
                 logger.info(f"Processing website link: {link}")
-                driver.get(link)
+            driver.get(link)
                 article_data = ArticleScraper(driver.page_source, link)
                 articles_by_link[link] = article_data
                 processed_count += 1
@@ -338,10 +335,10 @@ def process_links(driver: Optional[webdriver.Chrome], links: List[str], rss_moni
 
     return articles_by_link
 
-def add_feed(url: str, name: str = None) -> None:
+def add_feed(db: Database, url: str) -> None:
     """Add a new RSS feed to the database."""
-    if rss_monitor.add_feed(url, name):
-        print(f"Successfully added feed: {name or url}")
+    if db.add_feed(url, url):
+        print(f"Successfully added feed: {url}")
     else:
         print(f"Failed to add feed: {url}")
 
@@ -398,6 +395,7 @@ def process_articles(monitor: RSSMonitor, tag_manager: TagManager, lm_studio: LM
         logger.info(f"Processing {len(articles)} articles from RSS feeds")
         processed_count = 0
         success_count = 0
+        skipped_count = 0
 
         for url, article in articles.items():
             try:
@@ -409,6 +407,15 @@ def process_articles(monitor: RSSMonitor, tag_manager: TagManager, lm_studio: LM
                     logger.info(f"Skipping already processed article: {url}")
                     continue
 
+                # Ensure URL is set in article data
+                article['url'] = url
+
+                # Assess article relevance
+                if not tag_manager.assess_article_relevance(article):
+                    logger.info(f"Skipping irrelevant article: {url}")
+                    skipped_count += 1
+                    continue
+
                 # Rewrite content if enabled
                 if not skip_rewrite and CONFIG["general"]["auto_rewrite"]:
                     logger.info(f"Rewriting content for article: {url}")
@@ -416,7 +423,6 @@ def process_articles(monitor: RSSMonitor, tag_manager: TagManager, lm_studio: LM
                     if rewritten_article:
                         # Update article with rewritten content
                         article.update({
-                            'url': url,
                             'title': rewritten_article.get('title', article['title']),
                             'content': '\n\n'.join(rewritten_article.get('paragraphs', [])),
                             'ai_metadata': {
@@ -462,39 +468,40 @@ def process_articles(monitor: RSSMonitor, tag_manager: TagManager, lm_studio: LM
 
         # Save processed articles
         monitor.save_articles(articles)
-        logger.info(f"Processed {processed_count} articles, {success_count} successful")
+        logger.info(f"Processed {processed_count} articles, {success_count} successful, {skipped_count} skipped")
 
     except Exception as e:
         logger.error(f"Error in process_articles: {str(e)}")
         raise
 
-def add_thematic_prompt(tag_manager: TagManager, tag_name: str, prompt: str) -> bool:
-    """Add a thematic prompt for tag generation."""
-    try:
-        success = tag_manager.add_thematic_prompt(tag_name, prompt)
-        if success:
-            logger.info(f"Successfully added thematic prompt for tag: {tag_name}")
-        else:
-            logger.error(f"Failed to add thematic prompt for tag: {tag_name}")
-        return success
-    except Exception as e:
-        logger.error(f"Error adding thematic prompt: {e}")
-        return False
-
-def save_articles(articles: Dict[str, Dict[str, Any]], filename: str = 'articles_data.json') -> None:
+def remove_feed(db: Database, feed_id: int) -> bool:
     """
-    Save processed articles to a JSON file.
+    Remove a feed from the database.
     
     Args:
-        articles (Dict[str, Dict[str, Any]]): Dictionary of processed articles
-        filename (str): Output JSON file name
+        db (Database): Database instance
+        feed_id (int): ID of the feed to remove
+        
+    Returns:
+        bool: True if successful, False otherwise
     """
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(articles, f, ensure_ascii=False, indent=4)
-        logger.info(f"Saved {len(articles)} articles to {filename}")
+        # First check if the feed exists
+        feed = db.get_feed(feed_id)
+        if not feed:
+            logger.error(f"Feed with ID {feed_id} not found")
+            return False
+            
+        # Remove the feed
+        success = db.remove_feed(feed_id)
+        if success:
+            logger.info(f"Successfully removed feed with ID {feed_id}")
+        else:
+            logger.error(f"Failed to remove feed with ID {feed_id}")
+        return success
     except Exception as e:
-        logger.error(f"Error saving articles to {filename}: {e}")
+        logger.error(f"Error removing feed: {e}")
+        return False
 
 def main():
     try:
@@ -543,22 +550,47 @@ def main():
             remove_feed(db, args.remove_feed)
         elif args.list_feeds:
             list_feeds(db)
-        elif args.add_thematic_prompt:
-            if not args.tag_name or not args.prompt:
-                logger.error("Both --tag-name and --prompt are required with --add-thematic-prompt")
-                sys.exit(1)
-            add_thematic_prompt(tag_manager, args.tag_name, args.prompt)
         else:
-            # Process articles
-            process_articles(
-                monitor=monitor,
-                tag_manager=tag_manager,
-                lm_studio=lm_studio,
-                wordpress=wordpress,
-                limit=args.limit,
-                skip_rewrite=args.skip_rewrite,
-                skip_wordpress=args.skip_wordpress
-            )
+            # Get check interval from config (default to 1 hour)
+            check_interval = CONFIG["monitor"].get("check_interval", 3600)
+            logger.info(f"Starting RSS feed monitoring with {check_interval} second interval")
+            
+            try:
+                while True:
+                    try:
+                        # Process articles
+                        process_articles(
+                            monitor=monitor,
+                            tag_manager=tag_manager,
+                            lm_studio=lm_studio,
+                            wordpress=wordpress,
+                            limit=args.limit,
+                            skip_rewrite=args.skip_rewrite,
+                            skip_wordpress=args.skip_wordpress
+                        )
+                        
+                        # Log next check time
+                        next_check = datetime.now() + timedelta(seconds=check_interval)
+                        logger.info(f"Next feed check scheduled for: {next_check}")
+                        
+                        # Wait for next check interval
+                        time.sleep(check_interval)
+                        
+                    except KeyboardInterrupt:
+                        logger.info("Received shutdown signal. Stopping gracefully...")
+                        break
+                    except Exception as e:
+                        logger.error(f"Error during feed check cycle: {str(e)}")
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+                        # Wait a bit before retrying on error
+                        time.sleep(60)  # Wait 1 minute before retrying
+                        continue
+                        
+            except KeyboardInterrupt:
+                logger.info("Shutting down...")
+            except Exception as e:
+                logger.error(f"Fatal error in main loop: {str(e)}")
+                raise
     
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
