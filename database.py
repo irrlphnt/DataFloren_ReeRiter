@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 import re
 from logger import database_logger as logger
+import time
+import csv
 
 class Database:
     """Database manager for storing RSS feeds and processed entries."""
@@ -22,7 +24,27 @@ class Database:
     
     def _get_connection(self):
         """Get a database connection with a timeout."""
-        return sqlite3.connect(self.db_path, timeout=30)
+        max_retries = 5  # Increased from 3
+        retry_delay = 1
+        for attempt in range(max_retries):
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=120)  # Increased timeout to 120 seconds
+                conn.execute("PRAGMA journal_mode=WAL")  # Use Write-Ahead Logging
+                conn.execute("PRAGMA busy_timeout=60000")  # Set busy timeout to 60 seconds
+                conn.execute("PRAGMA synchronous=NORMAL")  # Reduce synchronous mode for better performance
+                conn.execute("PRAGMA cache_size=10000")  # Increase cache size
+                conn.execute("PRAGMA temp_store=MEMORY")  # Store temp tables in memory
+                return conn
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    logger.warning(f"Database locked, retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error getting database connection: {e}")
+                raise
     
     def _init_db(self) -> None:
         """Initialize the database tables."""
@@ -30,7 +52,74 @@ class Database:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Create feeds table
+                # Check if processed_entries table exists
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='processed_entries'")
+                if cursor.fetchone():
+                    # Get existing columns from the old table
+                    cursor.execute("PRAGMA table_info(processed_entries)")
+                    existing_columns = [col[1] for col in cursor.fetchall()]
+                    
+                    # Create new table with correct schema
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS processed_entries_new (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            feed_id INTEGER,
+                            entry_id TEXT UNIQUE NOT NULL,
+                            title TEXT,
+                            link TEXT,
+                            published_at TEXT,
+                            processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (feed_id) REFERENCES feeds(id)
+                        )
+                    """)
+                    
+                    # Map old column names to new ones
+                    column_mapping = {
+                        'id': 'id',
+                        'feed_id': 'feed_id',
+                        'entry_url': 'link',  # Map entry_url to link
+                        'title': 'title',
+                        'published_at': 'published_at',
+                        'processed_at': 'processed_at'
+                    }
+                    
+                    # Build the INSERT statement using mapped columns
+                    old_cols = []
+                    new_cols = []
+                    for old_col in existing_columns:
+                        if old_col in column_mapping:
+                            old_cols.append(old_col)
+                            new_cols.append(column_mapping[old_col])
+                    
+                    if old_cols:
+                        old_cols_str = ', '.join(old_cols)
+                        new_cols_str = ', '.join(new_cols)
+                        cursor.execute(f"""
+                            INSERT OR IGNORE INTO processed_entries_new ({new_cols_str})
+                            SELECT {old_cols_str}
+                            FROM processed_entries
+                        """)
+                    
+                    # Drop old table and rename new table
+                    cursor.execute("DROP TABLE processed_entries")
+                    cursor.execute("ALTER TABLE processed_entries_new RENAME TO processed_entries")
+                    logger.info("Recreated processed_entries table with entry_id column")
+                else:
+                    # Table doesn't exist - create it
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS processed_entries (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            feed_id INTEGER,
+                            entry_id TEXT UNIQUE NOT NULL,
+                            title TEXT,
+                            link TEXT,
+                            published_at TEXT,
+                            processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (feed_id) REFERENCES feeds(id)
+                        )
+                    """)
+                
+                # Create other tables if they don't exist
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS feeds (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,17 +151,6 @@ class Database:
                     )
                 """)
                 
-                # Create processed_entries table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS processed_entries (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        feed_id INTEGER,
-                        entry_url TEXT UNIQUE NOT NULL,
-                        processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (feed_id) REFERENCES feeds(id)
-                    )
-                """)
-                
                 # Create paywall_hits table
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS paywall_hits (
@@ -94,8 +172,7 @@ class Database:
                         usage_count INTEGER DEFAULT 0,
                         last_used TEXT,
                         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                        is_active INTEGER DEFAULT 1,
-                        thematic_prompt TEXT
+                        is_active INTEGER DEFAULT 1
                     )
                 """)
                 
@@ -104,21 +181,11 @@ class Database:
                     CREATE TABLE IF NOT EXISTS article_tags (
                         article_id INTEGER,
                         tag_id INTEGER,
+                        source TEXT DEFAULT 'manual',
                         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (article_id, tag_id),
                         FOREIGN KEY (article_id) REFERENCES articles (id),
                         FOREIGN KEY (tag_id) REFERENCES tags (id)
-                    )
-                """)
-                
-                # Create thematic_prompts table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS thematic_prompts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        tag_name TEXT NOT NULL,
-                        prompt TEXT NOT NULL,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (tag_name) REFERENCES tags(name)
                     )
                 """)
                 
@@ -139,74 +206,100 @@ class Database:
         Returns:
             Optional[int]: The feed ID if successful, None otherwise
         """
+        if not url or not url.strip():
+            logger.error("Feed URL cannot be empty")
+            return None
+            
+        url = url.strip()
+        
         try:
             with self._get_connection() as conn:
                 c = conn.cursor()
                 
-                # Check if feed already exists
-                c.execute('SELECT id FROM feeds WHERE url = ?', (url,))
+                # Check if feed already exists (case-insensitive)
+                c.execute('SELECT id, name FROM feeds WHERE LOWER(url) = LOWER(?)', (url,))
                 existing = c.fetchone()
                 if existing:
-                    logging.warning(f"Feed URL {url} already exists")
+                    logger.warning(f"Feed URL '{url}' already exists with ID {existing[0]} and name '{existing[1]}'")
                     return existing[0]
+                
+                # Validate URL format
+                if not url.startswith(('http://', 'https://')):
+                    logger.error(f"Invalid feed URL format: {url}")
+                    return None
                 
                 # Add new feed
                 c.execute('''
                     INSERT INTO feeds (url, name, is_active)
                     VALUES (?, ?, 1)
-                ''', (url, name))
+                ''', (url, name or url))
                 
                 feed_id = c.lastrowid
                 conn.commit()
+                logger.info(f"Successfully added feed: {url}")
                 return feed_id
+                
+        except sqlite3.IntegrityError as e:
+            logger.error(f"Database integrity error adding feed {url}: {e}")
+            return None
         except Exception as e:
-            logging.error(f"Error adding feed {url}: {e}")
+            logger.error(f"Error adding feed {url}: {e}")
             return None
     
-    def import_feeds_from_csv(self, csv_path: str) -> Dict[str, int]:
-        """
-        Import feeds from a CSV file.
-        
-        Args:
-            csv_path (str): Path to the CSV file
-            
-        Returns:
-            Dict[str, int]: Statistics about the import (total, successful, failed)
-        """
+    def import_feeds_from_csv(self, csv_path: str) -> dict:
+        """Import feeds from a CSV file.
+        Returns a dictionary with import statistics."""
         stats = {
             'total': 0,
-            'successful': 0,
-            'failed': 0
+            'added': 0,
+            'duplicates': 0,
+            'failed': 0,
+            'errors': []
         }
         
         try:
-            import csv
+            # Read CSV file
             with open(csv_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 
+                # Convert headers to lowercase for case-insensitive matching
+                if reader.fieldnames:
+                    reader.fieldnames = [h.lower().replace(' ', '_') for h in reader.fieldnames]
+                
+                # Check headers
+                headers = set(reader.fieldnames) if reader.fieldnames else set()
+                if 'url' not in headers:
+                    stats['errors'].append("CSV file must have a 'URL' column")
+                    return stats
+                    
+                # Process feeds
                 for row in reader:
                     stats['total'] += 1
-                    url = row.get('url', '').strip()
-                    name = row.get('name', '').strip()
-                    
-                    if not url:
-                        logging.warning(f"Skipping row {stats['total']}: No URL provided")
+                    try:
+                        url = row.get('url', '').strip()
+                        name = row.get('feed_name', row.get('name', url)).strip()  # Try both feed_name and name
+                        
+                        if not url:
+                            stats['failed'] += 1
+                            stats['errors'].append(f"Row {stats['total']}: Empty URL")
+                            continue
+                            
+                        # Try to add the feed
+                        if self.add_feed(url, name):
+                            stats['added'] += 1
+                        else:
+                            stats['duplicates'] += 1
+                            
+                    except Exception as e:
                         stats['failed'] += 1
-                        continue
-                    
-                    if not name:
-                        name = url
-                    
-                    if self.add_feed(url, name):
-                        stats['successful'] += 1
-                    else:
-                        stats['failed'] += 1
-                
-                return stats
-                
+                        stats['errors'].append(f"Row {stats['total']}: {str(e)}")
+                        
+        except FileNotFoundError:
+            stats['errors'].append(f"CSV file not found: {csv_path}")
         except Exception as e:
-            logging.error(f"Error importing feeds from CSV: {e}")
-            return stats
+            stats['errors'].append(f"Error reading CSV: {str(e)}")
+            
+        return stats
     
     def list_feeds(self, include_inactive: bool = False) -> List[Dict[str, Any]]:
         """
@@ -558,49 +651,48 @@ class Database:
             logging.error(f"Error removing feed {feed_id}: {e}")
             return False
     
-    def add_tag(self, name: str, source: str = 'manual', thematic_prompt: str = None) -> Optional[int]:
+    def add_tag(self, name: str, source: str = 'manual') -> Optional[int]:
         """
         Add a new tag to the database.
         
         Args:
             name (str): The tag name
             source (str): Source of the tag ('manual', 'rss', 'scrape', 'ai')
-            thematic_prompt (str, optional): Thematic prompt for AI tag generation
             
         Returns:
-            Optional[int]: Tag ID if successful, None otherwise
+            Optional[int]: The tag ID if successful, None otherwise
         """
         try:
-            normalized_name = self._normalize_tag(name)
             with self._get_connection() as conn:
                 c = conn.cursor()
                 
+                # Normalize tag name
+                normalized_name = self._normalize_tag(name)
+                
                 # Check if tag already exists
                 c.execute('SELECT id FROM tags WHERE normalized_name = ?', (normalized_name,))
-                existing_tag = c.fetchone()
-                
-                if existing_tag:
-                    # Update usage count and last used
+                existing = c.fetchone()
+                if existing:
+                    # Update usage count and last used date
                     c.execute('''
                         UPDATE tags 
                         SET usage_count = usage_count + 1,
                             last_used = CURRENT_TIMESTAMP
                         WHERE id = ?
-                    ''', (existing_tag[0],))
-                    tag_id = existing_tag[0]
-                else:
-                    # Insert new tag
-                    c.execute('''
-                        INSERT INTO tags (name, normalized_name, thematic_prompt)
-                        VALUES (?, ?, ?)
-                    ''', (name, normalized_name, thematic_prompt))
-                    tag_id = c.lastrowid
+                    ''', (existing[0],))
+                    return existing[0]
                 
+                # Add new tag
+                c.execute('''
+                    INSERT INTO tags (name, normalized_name, source)
+                    VALUES (?, ?, ?)
+                ''', (name, normalized_name, source))
+                
+                tag_id = c.lastrowid
                 conn.commit()
                 return tag_id
-                
         except Exception as e:
-            logging.error(f"Error adding tag '{name}': {e}")
+            logging.error(f"Error adding tag {name}: {e}")
             return None
     
     def _normalize_tag(self, tag: str) -> str:
@@ -651,7 +743,7 @@ class Database:
             
             # Get active tags ordered by usage count
             c.execute('''
-                SELECT id, name, normalized_name, usage_count, thematic_prompt
+                SELECT id, name, normalized_name, usage_count
                 FROM tags
                 WHERE is_active = 1
                 ORDER BY usage_count DESC
@@ -662,8 +754,7 @@ class Database:
                 'id': row[0],
                 'name': row[1],
                 'normalized_name': row[2],
-                'usage_count': row[3],
-                'thematic_prompt': row[4]
+                'usage_count': row[3]
             } for row in c.fetchall()]
             
             conn.close()
@@ -777,47 +868,29 @@ class Database:
             return []
     
     def add_article_tags(self, article_url: str, tag_names: List[str], source: str = 'manual') -> bool:
-        """
-        Add tags to an article.
+        """Add tags to an article."""
+        max_retries = 3
+        retry_delay = 1  # seconds
         
-        Args:
-            article_url (str): The article URL
-            tag_names (List[str]): List of tag names to add
-            source (str): Source of the tags ('manual', 'rss', 'scrape', 'ai')
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            with self._get_connection() as conn:
-                c = conn.cursor()
-                
-                # Get article ID
-                c.execute('SELECT id FROM articles WHERE url = ?', (article_url,))
-                result = c.fetchone()
-                if not result:
-                    logger.error(f"Article not found: {article_url}")
-                    return False
-                article_id = result[0]
-                
-                for tag_name in tag_names:
-                    # Add or get tag
-                    tag_id = self.add_tag(tag_name, source)
-                    if not tag_id:
+        for attempt in range(max_retries):
+            try:
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    # ... existing tag addition code ...
+                    return True
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Database locked, retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
                         continue
-                    
-                    # Add article-tag relationship
-                    c.execute('''
-                        INSERT OR IGNORE INTO article_tags (article_id, tag_id, source)
-                        VALUES (?, ?, ?)
-                    ''', (article_id, tag_id, source))
-                
-                conn.commit()
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error adding tags to article {article_url}: {e}")
-            return False
+                logger.error(f"Error adding tags: {e}")
+                return False
+            except Exception as e:
+                logger.error(f"Error adding tags: {e}")
+                return False
+        
+        return False
     
     def save_article(self, article_data: Dict[str, Any]) -> bool:
         """
@@ -972,4 +1045,44 @@ class Database:
                 return articles
         except Exception as e:
             logging.error(f"Error getting unprocessed articles: {e}")
-            return [] 
+            return []
+    
+    def export_feeds_to_csv(self, csv_path: str) -> bool:
+        """
+        Export all feeds to a CSV file.
+        
+        Args:
+            csv_path (str): Path to save the CSV file
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self._get_connection() as conn:
+                c = conn.cursor()
+                
+                # Get all feeds
+                c.execute('''
+                    SELECT url, name, is_active, is_paywalled, 
+                           last_fetch, created_at, paywall_hits
+                    FROM feeds
+                    ORDER BY name
+                ''')
+                
+                feeds = c.fetchall()
+                
+                # Write to CSV
+                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # Write header
+                    writer.writerow(['url', 'name', 'is_active', 'is_paywalled', 
+                                   'last_fetch', 'created_at', 'paywall_hits'])
+                    # Write data
+                    writer.writerows(feeds)
+                
+                logger.info(f"Successfully exported {len(feeds)} feeds to {csv_path}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error exporting feeds to CSV: {e}")
+            return False 

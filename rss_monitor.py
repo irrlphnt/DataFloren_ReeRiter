@@ -38,11 +38,6 @@ class RSSMonitor:
         with open('config.json', 'r') as f:
             config = json.load(f)
             self.config = config.get('monitor', {})
-            
-            # Add feeds from config if they don't exist
-            feed_urls = self.config.get('rss_feeds', [])
-            for url in feed_urls:
-                self.db.add_feed(url)
         
         logger.info("RSS Monitor initialized")
     
@@ -281,85 +276,32 @@ class RSSMonitor:
     def _detect_paywall(self, content: str, url: str) -> bool:
         """
         Detect if content is behind a paywall.
-        
-        Args:
-            content (str): The HTML content to check
-            url (str): The URL being checked
-            
-        Returns:
-            bool: True if content appears to be paywalled
+        Returns True if paywall detected, False otherwise.
         """
-        # Common paywall indicators
+        # Only check if we have actual content
+        if not content or len(content.strip()) < 100:
+            return True
+        
+        # Common paywall indicators that actually block content
         paywall_indicators = [
-            'subscribe now',
-            'subscribe to read',
-            'paywall',
-            'premium content',
-            'premium article',
-            'premium subscriber',
-            'subscriber exclusive',
-            'subscriber only',
-            'members only',
-            'sign up to read',
-            'sign up to continue',
-            'continue reading',
-            'read more',
-            'unlimited access',
-            'digital subscription',
-            'subscribe for full access',
-            'subscribe to continue',
-            'subscribe to view',
-            'subscribe to read more',
-            'subscribe to access',
-            'subscribe to unlock',
-            'subscribe to get access',
-            'subscribe to read the full article',
-            'subscribe to read the full story',
-            'subscribe to read the full text',
-            'subscribe to read the full content',
-            'subscribe to read the full version',
-            'subscribe to read the full piece',
-            'subscribe to read the full report',
-            'subscribe to read the full analysis',
-            'subscribe to read the full interview',
-            'subscribe to read the full feature',
-            'subscribe to read the full investigation',
-            'subscribe to read the full coverage',
-            'subscribe to read the full story',
-            'subscribe to read the full article',
-            'subscribe to read the full text',
-            'subscribe to read the full content',
-            'subscribe to read the full version',
-            'subscribe to read the full piece',
-            'subscribe to read the full report',
-            'subscribe to read the full analysis',
-            'subscribe to read the full interview',
-            'subscribe to read the full feature',
-            'subscribe to read the full investigation',
-            'subscribe to read the full coverage'
+            "subscribe to continue reading",
+            "subscribe to read the full article",
+            "subscribe to access",
+            "premium content",
+            "subscribers only",
+            "for subscribers",
+            "sign in to read"
         ]
         
-        # Check for paywall indicators in the content
+        # Check for definitive paywall blocks
         content_lower = content.lower()
         for indicator in paywall_indicators:
             if indicator in content_lower:
-                logger.info(f"Paywall detected in {url} using indicator: {indicator}")
-                return True
-        
-        # Check for common paywall class names and IDs
-        soup = BeautifulSoup(content, 'html.parser')
-        paywall_classes = ['paywall', 'premium', 'subscriber', 'members-only', 'subscribe']
-        paywall_ids = ['paywall', 'premium', 'subscriber', 'members-only', 'subscribe']
-        
-        for element in soup.find_all(class_=paywall_classes):
-            if element.get_text().strip():
-                logger.info(f"Paywall detected in {url} using class: {element.get('class')}")
-                return True
-        
-        for element in soup.find_all(id=paywall_ids):
-            if element.get_text().strip():
-                logger.info(f"Paywall detected in {url} using ID: {element.get('id')}")
-                return True
+                # Only consider it a paywall if we have very little content
+                # This helps ignore subscription prompts on articles we can still read
+                paragraphs = [p for p in content.split('\n') if len(p.strip()) > 50]
+                if len(paragraphs) < 3:  # Less than 3 substantial paragraphs
+                    return True
         
         return False
     
@@ -524,24 +466,25 @@ class RSSMonitor:
             logger.error(f"Error extracting content from article {url}: {e}")
             return None
     
-    def get_entries(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def get_entries(self, feed_url: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Get entries from active feeds.
         
         Args:
+            feed_url (str, optional): Specific feed URL to fetch. If None, fetches all active feeds.
             limit (int, optional): Maximum number of entries to return
             
         Returns:
             List[Dict[str, Any]]: List of feed entries
         """
         entries = []
-        feeds = self.db.get_active_feeds()
         
-        for feed in feeds:
+        # If a specific feed URL is provided, only fetch that feed
+        if feed_url:
             try:
-                feed_data = self._fetch_feed(feed['url'])
+                feed_data = self._fetch_feed(feed_url)
                 if not feed_data:
-                    continue
+                    return []
                 
                 # Process entries
                 for entry in feed_data.entries[:self.max_entries]:
@@ -554,8 +497,7 @@ class RSSMonitor:
                             'author': entry.get('author', ''),
                             'summary': entry.get('summary', ''),
                             'tags': [tag.get('term', '') for tag in entry.get('tags', [])],
-                            'source_feed': feed['url'],
-                            'feed_id': feed['id']
+                            'source_feed': feed_url
                         }
                         
                         # Convert published date to ISO format if available
@@ -570,12 +512,53 @@ class RSSMonitor:
                         entries.append(article_data)
                         
                     except Exception as e:
-                        logger.error(f"Error processing entry from feed {feed['url']}: {e}")
+                        logger.error(f"Error processing entry from feed {feed_url}: {e}")
+                        continue
+            except Exception as e:
+                logger.error(f"Error fetching feed {feed_url}: {e}")
+                return []
+        else:
+            # Fetch all active feeds
+            feeds = self.db.get_active_feeds()
+            for feed in feeds:
+                try:
+                    feed_data = self._fetch_feed(feed['url'])
+                    if not feed_data:
                         continue
                     
-            except Exception as e:
-                logger.error(f"Error fetching feed {feed['url']}: {e}")
-                continue
+                    # Process entries
+                    for entry in feed_data.entries[:self.max_entries]:
+                        try:
+                            # Extract article data
+                            article_data = {
+                                'title': entry.get('title', ''),
+                                'link': entry.get('link', ''),
+                                'published_date': entry.get('published', ''),
+                                'author': entry.get('author', ''),
+                                'summary': entry.get('summary', ''),
+                                'tags': [tag.get('term', '') for tag in entry.get('tags', [])],
+                                'source_feed': feed['url'],
+                                'feed_id': feed['id']
+                            }
+                            
+                            # Convert published date to ISO format if available
+                            if article_data['published_date']:
+                                try:
+                                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                                        parsed_date = datetime.fromtimestamp(mktime(entry.published_parsed))
+                                        article_data['published_date'] = parsed_date.isoformat()
+                                except Exception as e:
+                                    logger.warning(f"Could not parse date '{article_data['published_date']}': {e}")
+                            
+                            entries.append(article_data)
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing entry from feed {feed['url']}: {e}")
+                            continue
+                        
+                except Exception as e:
+                    logger.error(f"Error fetching feed {feed['url']}: {e}")
+                    continue
         
         # Sort entries by date (newest first) and apply limit
         entries.sort(key=lambda x: x.get('published_date', ''), reverse=True)
@@ -743,4 +726,28 @@ class RSSMonitor:
             logger.info(f"Saved {saved_count} processed articles to database")
             
         except Exception as e:
-            logger.error(f"Error saving articles to database: {e}") 
+            logger.error(f"Error saving articles to database: {e}")
+    
+    def get_feed_articles(self, feed_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all articles for a specific feed.
+        
+        Args:
+            feed_id (int): The feed ID
+            
+        Returns:
+            List[Dict[str, Any]]: List of articles for the feed
+        """
+        return self.db.get_feed_articles(feed_id)
+    
+    def remove_feed(self, feed_id: int) -> bool:
+        """
+        Remove a feed from the database.
+        
+        Args:
+            feed_id (int): The feed ID
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        return self.db.remove_feed(feed_id) 
