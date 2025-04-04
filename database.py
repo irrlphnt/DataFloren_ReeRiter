@@ -377,43 +377,18 @@ class Database:
         finally:
             conn.close()
     
-    def mark_entry_processed(self, feed_id: int, entry_id: str, title: str, 
-                           link: str, published_at: Optional[str] = None) -> bool:
-        """
-        Mark an entry as processed in the database.
-        
-        Args:
-            feed_id (int): The ID of the feed
-            entry_id (str): The unique ID of the entry
-            title (str): The entry title
-            link (str): The entry URL
-            published_at (Optional[str]): The publication date
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
+    def mark_entry_processed(self, feed_id: int, entry_id: str, title: str = '', link: str = '', published_at: str = ''):
+        """Mark an entry as processed."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("""
-                INSERT OR IGNORE INTO processed_entries 
-                (feed_id, entry_id, title, link, published_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (feed_id, entry_id, title, link, published_at))
-            
-            # Update feed's last fetch time
-            c.execute("""
-                UPDATE feeds 
-                SET last_fetch = CURRENT_TIMESTAMP 
-                WHERE id = ?
-            """, (feed_id,))
-            
-            conn.commit()
-            conn.close()
-            return c.rowcount > 0
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO processed_entries (feed_id, entry_id, title, link, published_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (feed_id, entry_id, title, link, published_at))
+                conn.commit()
         except Exception as e:
-            logging.error(f"Error marking entry as processed: {e}")
-            return False
+            logger.error(f"Error marking entry as processed: {e}")
     
     def is_entry_processed(self, entry_id: str) -> bool:
         """
@@ -1169,4 +1144,53 @@ class Database:
                 return result[0] if result else None
         except Exception as e:
             logger.error(f"Error getting WordPress post ID: {e}")
-            return None 
+            return None
+    
+    def get_unprocessed_entries(self, feed_id: int) -> List[Dict[str, Any]]:
+        """Get unprocessed entries for a specific feed."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, url, title, content, author, published_date
+                    FROM articles
+                    WHERE feed_id = ? AND processed = 0
+                """, (feed_id,))
+                columns = [description[0] for description in cursor.description]
+                entries = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                
+                # Map 'url' to 'link' for consistency
+                for entry in entries:
+                    entry['link'] = entry.pop('url', None)
+                
+                return entries
+        except Exception as e:
+            logger.error(f"Error getting unprocessed entries: {e}")
+            return []
+    
+    def update_wordpress_post_id(self, article_url: str, post_id: str):
+        """Update the WordPress post ID for an article."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE articles
+                    SET wordpress_post_id = ?, processed = 1
+                    WHERE url = ?
+                """, (post_id, article_url))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating WordPress post ID: {e}")
+    
+    def mark_entry_processed(self, feed_id: int, entry_id: str):
+        """Mark an entry as processed."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO processed_entries (feed_id, entry_id)
+                    VALUES (?, ?)
+                """, (feed_id, entry_id))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error marking entry as processed: {e}") 

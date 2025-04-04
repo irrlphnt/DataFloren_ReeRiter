@@ -92,7 +92,8 @@ class LMStudio:
             
             # Process each chunk and combine results
             results = []
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
+                logger.info(f"Processing chunk {i+1}/{len(chunks)}")
                 data = {
                     "messages": [
                         {"role": "user", "content": chunk}
@@ -105,25 +106,39 @@ class LMStudio:
                 if self.model:
                     data["model"] = self.model
                 
-                response = requests.post(
-                    f"{self.url}/chat/completions",
-                    headers=self.headers,
-                    json=data,
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    if result.get("choices") and result["choices"][0].get("message"):
-                        results.append(result["choices"][0]["message"]["content"])
+                try:
+                    response = requests.post(
+                        f"{self.url}/chat/completions",
+                        headers=self.headers,
+                        json=data,
+                        timeout=60  # Increased timeout to 60 seconds
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get("choices") and result["choices"][0].get("message"):
+                            results.append(result["choices"][0]["message"]["content"])
+                            logger.info(f"Successfully processed chunk {i+1}")
+                        else:
+                            logger.error("Invalid response format from LMStudio API")
+                            return None
                     else:
-                        logger.error("Invalid response format from LMStudio API")
+                        logger.error(f"Error from LMStudio API: {response.status_code}")
                         return None
-                else:
-                    logger.error(f"Error from LMStudio API: {response.status_code}")
+                        
+                except requests.Timeout:
+                    logger.error(f"Timeout processing chunk {i+1}")
+                    return None
+                except requests.RequestException as e:
+                    logger.error(f"Request error processing chunk {i+1}: {e}")
                     return None
             
-            return "\n".join(results) if results else None
+            if results:
+                logger.info("Successfully processed all chunks")
+                return "\n".join(results)
+            else:
+                logger.error("No results generated from any chunks")
+                return None
             
         except Exception as e:
             logger.error(f"Error generating text: {str(e)}")

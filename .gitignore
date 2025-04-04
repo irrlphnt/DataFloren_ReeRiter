@@ -2,7 +2,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 .Python
 build/
 develop-eggs/
@@ -21,8 +20,10 @@ wheels/
 *.egg
 
 # Virtual Environment
-venv/
+.env
+.venv
 env/
+venv/
 ENV/
 
 # IDE
@@ -34,11 +35,26 @@ ENV/
 # Project specific
 *.db
 *.sqlite3
+*.sqlite
+cache/
+logs/
 *.log
-articles_data.json
-rewritten_articles.json
-processing_state.json
-error_screenshot_*.png
+wordpress_cache.json
+rewriter_cache.json
+*_cache.json
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Data files
+*.csv
+!requirements.txt
+!test_requirements.txt
+
+# Temporary files
+*.bak
+*.tmp
+*.temp
 
 # Configuration
 config.json

@@ -412,24 +412,60 @@ def export_feeds(db: Database, csv_path: str) -> None:
     else:
         print(f"Failed to export feeds to: {csv_path}")
 
-def process_article(article_data: Dict[str, Any], lm_studio: Optional[LMStudio] = None) -> Dict[str, Any]:
-    """Process a single article."""
+def process_article(entry: Dict[str, Any], lm_studio: Optional[LMStudio] = None) -> Dict[str, Any]:
+    """Process an article entry."""
     try:
-        # Rewrite content if LMStudio is available
-        if lm_studio:
-            rewritten = lm_studio.rewrite_article(
-                article_data={
-                    'title': article_data.get('title', ''),
-                    'content': article_data.get('content', ''),
-                    'url': article_data.get('url', '')
-                },
-                max_tokens=1500
-            )
-            if rewritten:
-                article_data['rewritten_content'] = rewritten.get('content', '')
-                article_data['title'] = rewritten.get('title', article_data.get('title', ''))
+        # Create article data dictionary
+        article_data = {
+            'title': entry.get('title', ''),
+            'content': entry.get('content', ''),
+            'author': entry.get('author', ''),
+            'link': entry.get('link', ''),  # Store as 'link' to match entry format
+            'published_date': entry.get('published', '')
+        }
+        
+        # Log available fields
+        logger.info(f"Article fields: {', '.join(f'{k}: {bool(v)}' for k, v in article_data.items())}")
+        
+        # Try to rewrite with LMStudio if available
+        if lm_studio and lm_studio.is_available():
+            logger.info(f"Rewriting article: {article_data['title']}")
+            try:
+                # Create data for LMStudio with correct field names
+                lm_data = {
+                    'title': article_data['title'],
+                    'content': article_data['content'],
+                    'url': article_data['link']  # Pass as 'url' to LMStudio
+                }
+                
+                # Log LMStudio data
+                logger.info(f"LMStudio data fields: {', '.join(f'{k}: {bool(v)}' for k, v in lm_data.items())}")
+                
+                # Only proceed if we have the required fields
+                if lm_data['title'] and lm_data['content'] and lm_data['url']:
+                    rewritten = lm_studio.rewrite_article(
+                        article_data=lm_data,
+                        style="informative",
+                        tone="neutral",
+                        max_tokens=1500
+                    )
+                    if rewritten:
+                        # Update article data with rewritten content
+                        article_data['rewritten_content'] = '\n\n'.join(rewritten.get('paragraphs', []))
+                        article_data['title'] = rewritten.get('title', article_data['title'])
+                        logger.info(f"Successfully rewritten article: {article_data['title']}")
+                    else:
+                        logger.warning(f"Failed to rewrite article: {article_data['title']}")
+                else:
+                    logger.warning("Missing required fields for rewriting")
+            except Exception as e:
+                logger.error(f"Error rewriting article: {e}")
+                logger.warning("Using original content due to rewriting error")
+        else:
+            logger.warning("LMStudio not available, using original content")
         
         return article_data
+        
     except Exception as e:
         logger.error(f"Error processing article: {e}")
         return article_data
@@ -510,10 +546,7 @@ def main():
                         # Mark as processed
                         db.mark_entry_processed(
                             feed_id=feed['id'],
-                            entry_id=entry.get('id', ''),
-                            title=entry.get('title', ''),
-                            link=entry.get('link', ''),
-                            published_at=entry.get('published', '')
+                            entry_id=entry.get('id', '')
                         )
                         
                     except Exception as e:
