@@ -34,6 +34,8 @@ class Database:
                 conn.execute("PRAGMA synchronous=NORMAL")  # Reduce synchronous mode for better performance
                 conn.execute("PRAGMA cache_size=10000")  # Increase cache size
                 conn.execute("PRAGMA temp_store=MEMORY")  # Store temp tables in memory
+                conn.execute("PRAGMA mmap_size=30000000000")  # Enable memory mapping
+                conn.execute("PRAGMA page_size=4096")  # Optimize page size
                 return conn
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e) and attempt < max_retries - 1:
@@ -662,38 +664,54 @@ class Database:
         Returns:
             Optional[int]: The tag ID if successful, None otherwise
         """
-        try:
-            with self._get_connection() as conn:
-                c = conn.cursor()
-                
-                # Normalize tag name
-                normalized_name = self._normalize_tag(name)
-                
-                # Check if tag already exists
-                c.execute('SELECT id FROM tags WHERE normalized_name = ?', (normalized_name,))
-                existing = c.fetchone()
-                if existing:
-                    # Update usage count and last used date
-                    c.execute('''
-                        UPDATE tags 
-                        SET usage_count = usage_count + 1,
-                            last_used = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                    ''', (existing[0],))
-                    return existing[0]
-                
-                # Add new tag
-                c.execute('''
-                    INSERT INTO tags (name, normalized_name, source)
-                    VALUES (?, ?, ?)
-                ''', (name, normalized_name, source))
-                
-                tag_id = c.lastrowid
-                conn.commit()
-                return tag_id
-        except Exception as e:
-            logging.error(f"Error adding tag {name}: {e}")
-            return None
+        max_retries = 5
+        retry_delay = 1  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    # Normalize tag name
+                    normalized_name = self._normalize_tag(name)
+                    
+                    # Check if tag already exists
+                    cursor.execute('SELECT id FROM tags WHERE normalized_name = ?', (normalized_name,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        # Update usage count and last used date
+                        cursor.execute('''
+                            UPDATE tags 
+                            SET usage_count = usage_count + 1,
+                                last_used = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        ''', (existing[0],))
+                        return existing[0]
+                    
+                    # Add new tag
+                    cursor.execute('''
+                        INSERT INTO tags (name, normalized_name, source)
+                        VALUES (?, ?, ?)
+                    ''', (name, normalized_name, source))
+                    
+                    tag_id = cursor.lastrowid
+                    conn.commit()
+                    return tag_id
+                    
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    logger.warning(f"Database locked, retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                logger.error(f"Database error adding tag {name}: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Error adding tag {name}: {e}")
+                return None
+        
+        logger.error(f"Failed to add tag {name} after {max_retries} attempts")
+        return None
     
     def _normalize_tag(self, tag: str) -> str:
         """
@@ -893,45 +911,95 @@ class Database:
         return False
     
     def save_article(self, article_data: Dict[str, Any]) -> bool:
-        """
-        Save an article to the database.
-        
-        Args:
-            article_data (Dict[str, Any]): Article data including url, title, content, etc.
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
+        """Save an article to the database."""
         try:
             with self._get_connection() as conn:
-                c = conn.cursor()
+                cursor = conn.cursor()
                 
-                # Extract article data
-                url = article_data.get('url')
-                title = article_data.get('title')
-                content = article_data.get('content')
-                author = article_data.get('author')
-                published_date = article_data.get('published_date')
-                processed = article_data.get('processed', 0)
-                wordpress_post_id = article_data.get('wordpress_post_id')
-                feed_id = article_data.get('feed_id')
+                # Check if article already exists
+                cursor.execute("SELECT id FROM articles WHERE url = ?", (article_data['url'],))
+                existing = cursor.fetchone()
                 
-                # Save article
-                c.execute('''
-                    INSERT OR REPLACE INTO articles 
-                    (url, title, content, author, published_date, processed, wordpress_post_id, feed_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (url, title, content, author, published_date, processed, wordpress_post_id, feed_id))
+                if existing:
+                    # Update existing article
+                    cursor.execute("""
+                        UPDATE articles 
+                        SET title = ?, content = ?, author = ?, published_date = ?, 
+                            wordpress_post_id = ?, processed = 1
+                        WHERE url = ?
+                    """, (
+                        article_data['title'],
+                        article_data['content'],
+                        article_data.get('author', ''),
+                        article_data.get('published_date', ''),
+                        article_data.get('wordpress_post_id', ''),
+                        article_data['url']
+                    ))
+                    article_id = existing[0]
+                else:
+                    # Insert new article
+                    cursor.execute("""
+                        INSERT INTO articles (
+                            feed_id, url, title, content, author, published_date,
+                            wordpress_post_id, processed
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    """, (
+                        article_data.get('feed_id'),
+                        article_data['url'],
+                        article_data['title'],
+                        article_data['content'],
+                        article_data.get('author', ''),
+                        article_data.get('published_date', ''),
+                        article_data.get('wordpress_post_id', '')
+                    ))
+                    article_id = cursor.lastrowid
                 
-                # Save tags if present
+                # Handle tags if present
                 if 'tags' in article_data and article_data['tags']:
-                    self.add_article_tags(url, article_data['tags'], source='rss')
+                    for tag_name in article_data['tags']:
+                        tag_id = self.add_tag(tag_name, source='auto')
+                        if tag_id:
+                            cursor.execute("""
+                                INSERT OR IGNORE INTO article_tags (article_id, tag_id, source)
+                                VALUES (?, ?, 'auto')
+                            """, (article_id, tag_id))
                 
                 conn.commit()
                 return True
                 
         except Exception as e:
-            logger.error(f"Error saving article {article_data.get('url')}: {e}")
+            logger.error(f"Error saving article: {e}")
+            return False
+
+    def is_article_published_to_wordpress(self, article_url: str) -> bool:
+        """Check if an article has been published to WordPress."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT wordpress_post_id 
+                    FROM articles 
+                    WHERE url = ? AND wordpress_post_id IS NOT NULL
+                """, (article_url,))
+                return bool(cursor.fetchone())
+        except Exception as e:
+            logger.error(f"Error checking WordPress publication status: {e}")
+            return False
+
+    def update_wordpress_post_id(self, article_url: str, post_id: str) -> bool:
+        """Update the WordPress post ID for an article."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE articles 
+                    SET wordpress_post_id = ? 
+                    WHERE url = ?
+                """, (post_id, article_url))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error updating WordPress post ID: {e}")
             return False
     
     def get_feed(self, feed_id: int) -> Optional[Dict[str, Any]]:
@@ -1085,4 +1153,20 @@ class Database:
                 
         except Exception as e:
             logger.error(f"Error exporting feeds to CSV: {e}")
-            return False 
+            return False
+
+    def get_wordpress_post_id(self, article_url: str) -> Optional[str]:
+        """Get the WordPress post ID for an article."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT wordpress_post_id 
+                    FROM articles 
+                    WHERE url = ? AND wordpress_post_id IS NOT NULL
+                """, (article_url,))
+                result = cursor.fetchone()
+                return result[0] if result else None
+        except Exception as e:
+            logger.error(f"Error getting WordPress post ID: {e}")
+            return None 

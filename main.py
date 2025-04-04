@@ -32,20 +32,8 @@ def load_config():
         with open('config.json', 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception as e:
-        print(f"Warning: Could not load config.json - {e}")
-        return {
-            "monitor": {
-                "website_url": "https://datafloren.net",
-                "link_limit": 5,
-                "use_rss": False,
-                "rss_feeds": [],
-                "rss_max_entries": 10
-            },
-            "openai": {},
-            "wordpress": {},
-            "general": {"auto_rewrite": True, "auto_post": False, "log_level": "INFO"},
-            "lm_studio": {}
-        }
+        logger.error(f"Error loading config: {e}")
+        return {}
 
 def parse_args():
     """Parse command line arguments."""
@@ -273,12 +261,12 @@ def get_article_links() -> List[str]:
 def process_links(driver, links, rss_monitor=None):
     """
     Process a list of links, fetching and extracting article data from each link.
-    
+
     Args:
         driver: Selenium WebDriver instance
         links: List of URLs to process
         rss_monitor: Optional RSSMonitor instance for feed processing
-        
+
     Returns:
         Dict[str, Dict[str, Any]]: Dictionary of processed article data
     """
@@ -286,7 +274,7 @@ def process_links(driver, links, rss_monitor=None):
     total_links = len(links)
     processed = 0
     failed = 0
-    
+
     for link in links:
         try:
             processed += 1
@@ -424,255 +412,118 @@ def export_feeds(db: Database, csv_path: str) -> None:
     else:
         print(f"Failed to export feeds to: {csv_path}")
 
-def process_article(article_data):
+def process_article(article_data: Dict[str, Any], lm_studio: Optional[LMStudio] = None) -> Dict[str, Any]:
+    """Process a single article."""
     try:
-        # Rewrite article without the title parameter
-        rewritten_content = lm_studio.rewrite_article(
-            article_data={
-                'title': article_data.get('title', ''),
-                'content': article_data.get('content', ''),
-                'url': article_data.get('url', '')
-            },
-            max_tokens=1500
-        )
-        if rewritten_content:
-            article_data['rewritten_content'] = rewritten_content.get('content', '')
-        
-        # Generate tags from the content
-        article_content = article_data.get('content', '')
-        if isinstance(article_content, dict):
-            article_content = article_content.get('text', '')
-        tags = []
-        if tag_manager:
-            try:
-                # Create article data dictionary
-                article_data = {
+        # Rewrite content if LMStudio is available
+        if lm_studio:
+            rewritten = lm_studio.rewrite_article(
+                article_data={
                     'title': article_data.get('title', ''),
-                    'content': article_content,
+                    'content': article_data.get('content', ''),
                     'url': article_data.get('url', '')
-                }
-                tags = tag_manager.generate_tags(article_data)
-            except Exception as e:
-                logger.error(f"Error generating tags: {e}")
-        article_data['tags'] = tags
+                },
+                max_tokens=1500
+            )
+            if rewritten:
+                article_data['rewritten_content'] = rewritten.get('content', '')
+                article_data['title'] = rewritten.get('title', article_data.get('title', ''))
         
+        return article_data
     except Exception as e:
         logger.error(f"Error processing article: {e}")
-    return article_data
+        return article_data
 
 def main():
     try:
-        args = parse_args()
+        # Load configuration
+        CONFIG = load_config()
         
-        # Initialize database
+        # Initialize components
         db = Database()
-        logger.info("Database initialized")
+        wordpress = WordPressPoster(
+            wp_url=CONFIG["wordpress"]["url"],
+            username=CONFIG["wordpress"]["username"],
+            password=CONFIG["wordpress"]["password"]
+        )
         
-        # Handle command line arguments
-        if args.add_feed:
-            add_feed(db, args.add_feed)
-        elif args.remove_feed:
-            remove_feed(db, args.remove_feed)
-        elif args.list_feeds:
-            list_feeds(db)
-        elif args.import_feeds:
-            import_feeds_from_csv(args.import_feeds)
-        elif args.export_feeds:
-            export_feeds(db, args.export_feeds)
-        else:
-            # Initialize LMStudio if enabled
-            lm_studio = None
-            if CONFIG["lm_studio"].get("use_lm_studio", False):
-                lm_studio = LMStudio(
-                    url=CONFIG["lm_studio"].get("url", "http://localhost:1234/v1"),
-                    model=CONFIG["lm_studio"].get("model", "mistral-7b-instruct-v0.3")
-                )
-                logger.info("LMStudio initialized")
-            
-            # Initialize tag manager with LMStudio
-            tag_manager = TagManager(db=db, lm_studio=lm_studio)
-            logger.info("Tag manager initialized")
-            
-            # Initialize WordPress if enabled
-            wordpress = None
-            if CONFIG["wordpress"].get("use_wordpress", False):
-                wp_url = CONFIG["wordpress"].get("url")
-                wp_username = CONFIG["wordpress"].get("username")
-                wp_password = CONFIG["wordpress"].get("password")
+        lm_studio = None
+        if CONFIG["lm_studio"].get("use_lm_studio", False):
+            lm_studio = LMStudio(
+                url=CONFIG["lm_studio"].get("url", "http://localhost:1234/v1"),
+                model=CONFIG["lm_studio"].get("model", "mistral-7b-instruct-v0.3")
+            )
+        
+        # Get active feeds
+        feeds = db.get_active_feeds()
+        if not feeds:
+            logger.warning("No active feeds found")
+            return
+        
+        # Process each feed
+        for feed in feeds:
+            try:
+                logger.info(f"Processing feed: {feed['name']}")
                 
-                if not all([wp_url, wp_username, wp_password]):
-                    logger.error("WordPress configuration is incomplete. Please check config.json")
-                else:
-                    wordpress = WordPressPoster(
-                        wp_url=wp_url,
-                        username=wp_username,
-                        password=wp_password
-                    )
-                    logger.info("WordPress initialized successfully")
-            else:
-                logger.warning("WordPress publishing is disabled in config.json")
-            
-            # Initialize RSS monitor
-            rss_monitor = RSSMonitor(db=db)
-            logger.info("RSS Monitor initialized")
-            
-            # Get check interval from config (default to 1 hour)
-            check_interval = CONFIG["monitor"].get("check_interval", 3600)
-            logger.info(f"Starting RSS feed monitoring with {check_interval} second interval")
-            
-            # Invert the WordPress publishing logic - now it's enabled by default
-            publish_to_wordpress = not args.skip_wordpress
-            
-            while True:
-                try:
-                    # Get active feeds
-                    feeds = db.get_active_feeds()
-                    if not feeds:
-                        logger.warning("No active feeds found")
-                        time.sleep(check_interval)
-                        continue
-                        
-                    logger.info(f"Processing {len(feeds)} active feeds")
-                    
-                    # Process each feed
-                    for feed in feeds:
-                        try:
-                            logger.info(f"Processing feed: {feed['name']} ({feed['url']})")
-                            
-                            # Get feed entries using the correct method name and URL
-                            entries = rss_monitor.get_entries(feed['url'])
-                            if not entries:
-                                logger.warning(f"No entries found for feed: {feed['name']}")
-                                continue
-                                
-                            # Process entries
-                            for entry in entries:
-                                try:
-                                    # Generate a unique ID for the entry if it doesn't have one
-                                    entry_id = entry.get('id', entry.get('link', ''))
-                                    
-                                    # Check if entry has been processed
-                                    if db.is_entry_processed(entry_id):
-                                        logger.debug(f"Entry already processed: {entry.get('title', '')}")
-                                        continue
-                                        
-                                    # Extract article content using the correct method name
-                                    article_data = rss_monitor._extract_article_content(entry.get('link', ''), feed['id'], feed['url'])
-                                    if not article_data:
-                                        logger.warning(f"Failed to extract content for: {entry.get('title', '')}")
-                                        continue
-                                        
-                                    content = article_data['content']
-                                        
-                                    # Check for paywall using the correct method name
-                                    if rss_monitor._detect_paywall(content, entry.get('link', '')):
-                                        logger.warning(f"Paywall detected for: {entry.get('title', '')}")
-                                        rss_monitor._handle_paywall(feed['id'], feed['url'], entry.get('link', ''))
-                                        continue
-                                        
-                                    # Rewrite content if enabled
-                                    if not args.skip_rewrite and lm_studio:
-                                        try:
-                                            rewritten_content = lm_studio.rewrite_article(
-                                                article_data={
-                                                    'title': entry.get('title', ''),
-                                                    'content': content,
-                                                    'url': entry.get('link', '')
-                                                },
-                                                max_tokens=1500
-                                            )
-                                            if rewritten_content:
-                                                # Update both title and content from the rewritten version
-                                                content = rewritten_content.get('content', '')
-                                                entry['title'] = rewritten_content.get('title', entry.get('title', ''))
-                                                article_data['rewritten_content'] = content
-                                        except Exception as e:
-                                            logger.error(f"Error rewriting article: {e}")
-                                    
-                                    # Generate tags
-                                    tags = []
-                                    if tag_manager:
-                                        try:
-                                            # Create article data dictionary
-                                            article_data = {
-                                                'title': entry.get('title', ''),
-                                                'content': content if isinstance(content, str) else ' '.join(content) if isinstance(content, list) else '',
-                                                'url': entry.get('link', '')
-                                            }
-                                            tags = tag_manager.generate_tags(article_data)
-                                        except Exception as e:
-                                            logger.error(f"Error generating tags: {e}")
-                                    
-                                    # Save article to database
-                                    article_data = {
-                                        'url': entry.get('link', ''),
-                                        'title': entry.get('title', ''),
-                                        'content': content,
-                                        'author': entry.get('author', ''),
-                                        'published_date': entry.get('published', ''),
-                                        'feed_id': feed['id'],
-                                        'tags': tags
-                                    }
-                                    
-                                    if not db.save_article(article_data):
-                                        logger.error(f"Failed to save article: {entry.get('title', '')}")
-                                        continue
-                                        
-                                    # Post to WordPress if enabled
-                                    if publish_to_wordpress and wordpress:
-                                        try:
-                                            # Create article data dictionary with AI disclosure and attribution
-                                            article_data = {
-                                                'title': entry.get('title', ''),
-                                                'paragraphs': content.split('\n\n') if isinstance(content, str) else content,
-                                                'content': content,
-                                                'author': entry.get('author', ''),
-                                                'url': entry.get('link', ''),
-                                                'ai_metadata': {
-                                                    'generated_by': f"LMStudio ({CONFIG['lm_studio'].get('model', '')})",
-                                                    'generation_date': datetime.now().isoformat(),
-                                                    'original_source': entry.get('link', ''),
-                                                    'original_title': entry.get('title', '')
-                                                }
-                                            }
-                                            
-                                            post_id = wordpress.create_post(
-                                                article_data=article_data,
-                                                status=CONFIG["wordpress"].get("default_status", "draft")
-                                            )
-                                            if post_id:
-                                                logger.info(f"Posted to WordPress: {entry.get('title', '')}")
-                                        except Exception as e:
-                                            logger.error(f"Error posting to WordPress: {e}")
-                                    
-                                    # Mark entry as processed
-                                    db.mark_entry_processed(
-                                        feed_id=feed['id'],
-                                        entry_id=entry_id,
-                                        title=entry.get('title', ''),
-                                        link=entry.get('link', ''),
-                                        published_at=entry.get('published', '')
-                                    )
-                                    
-                                except Exception as e:
-                                    logger.error(f"Error processing entry: {e}")
-                                    continue
-                                    
-                        except Exception as e:
-                            logger.error(f"Error processing feed {feed['name']}: {e}")
+                # Get entries from feed
+                entries = db.get_unprocessed_entries(feed['id'])
+                if not entries:
+                    continue
+                
+                # Process each entry
+                for entry in entries:
+                    try:
+                        # Check if already published
+                        post_id = db.get_wordpress_post_id(entry.get('link', ''))
+                        if post_id and wordpress.verify_post_exists(post_id):
+                            logger.info(f"Article already published: {entry.get('title', '')}")
                             continue
-                    
-                    # Wait for next check
-                    logger.info(f"Waiting {check_interval} seconds before next check...")
-                    time.sleep(check_interval)
-                    
-                except KeyboardInterrupt:
-                    logger.info("Stopping RSS feed monitoring")
-                    break
-                except Exception as e:
-                    logger.error(f"Error in main loop: {e}")
-                    time.sleep(60)  # Wait a minute before retrying
-            
+                        
+                        # Process article
+                        article_data = process_article(entry, lm_studio)
+                        
+                        # Create WordPress post data
+                        wp_data = {
+                            'title': article_data.get('title', ''),
+                            'content': article_data.get('rewritten_content', article_data.get('content', '')),
+                            'author': article_data.get('author', ''),
+                            'url': article_data.get('link', ''),
+                            'ai_metadata': {
+                                'generated_by': f"LMStudio ({CONFIG['lm_studio'].get('model', '')})",
+                                'generation_date': datetime.now().isoformat(),
+                                'original_source': article_data.get('link', ''),
+                                'original_title': article_data.get('title', '')
+                            }
+                        }
+                        
+                        # Post to WordPress
+                        post_id = wordpress.create_post(
+                            article_data=wp_data,
+                            status=CONFIG["wordpress"].get("default_status", "draft")
+                        )
+                        
+                        if post_id:
+                            # Update database
+                            db.update_wordpress_post_id(article_data.get('link', ''), str(post_id))
+                            logger.info(f"Posted to WordPress: {article_data.get('title', '')}")
+                        
+                        # Mark as processed
+                        db.mark_entry_processed(
+                            feed_id=feed['id'],
+                            entry_id=entry.get('id', ''),
+                            title=entry.get('title', ''),
+                            link=entry.get('link', ''),
+                            published_at=entry.get('published', '')
+                        )
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing entry: {e}")
+                        continue
+                
+            except Exception as e:
+                logger.error(f"Error processing feed {feed['name']}: {e}")
+                continue
+    
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         raise

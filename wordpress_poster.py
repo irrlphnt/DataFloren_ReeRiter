@@ -145,7 +145,27 @@ class WordPressPoster:
             content.append(disclosure)
         
         # Add the main content
-        content.append(article_data['content'])
+        main_content = None
+        
+        # First try to get rewritten content if available
+        if article_data.get('rewritten_content'):
+            main_content = article_data['rewritten_content']
+        # Then try paragraphs
+        elif article_data.get('paragraphs'):
+            paragraphs = article_data['paragraphs']
+            if isinstance(paragraphs, list):
+                main_content = '\n\n'.join(paragraphs)
+            else:
+                main_content = paragraphs
+        # Finally try regular content
+        elif article_data.get('content'):
+            main_content = article_data['content']
+        
+        if main_content:
+            # Add the main content with proper paragraph formatting
+            content.append(main_content)
+        else:
+            logger.warning("No content found in article data")
         
         # Add attribution if available
         if article_data.get('author'):
@@ -167,15 +187,15 @@ class WordPressPoster:
         Returns:
             dict: The created post data if successful, None otherwise.
         """
-        # Skip if article title or paragraphs are missing
-        if not article_data or not article_data.get('title') or not article_data.get('paragraphs'):
+        # Skip if article title or content is missing
+        if not article_data or not article_data.get('title') or (not article_data.get('content') and not article_data.get('paragraphs')):
             logger.warning("Cannot create post: Missing title or content")
             return None
             
-        # Check if this article is already in the cache
-        cache_key = article_data.get('title', '')
+        # Check if this article is already in the cache using the URL as the key
+        cache_key = article_data.get('url', '')
         if cache_key in self.cache:
-            logger.info(f"Article already posted: {cache_key}")
+            logger.info(f"Article already posted: {article_data.get('title', '')}")
             return self.cache[cache_key]
             
         # Prepare post content
@@ -213,7 +233,7 @@ class WordPressPoster:
                 post_data = response.json()
                 logger.info(f"Successfully created post: {post_data.get('id')} - {article_data.get('title')}")
                 
-                # Save to cache
+                # Save to cache using URL as key
                 self.cache[cache_key] = post_data
                 self._save_cache()
                 
@@ -374,6 +394,26 @@ class WordPressPoster:
                 continue
         
         return posted_articles
+
+    def verify_post_exists(self, post_id: str) -> bool:
+        """
+        Verify if a post exists on WordPress by checking its ID.
+        
+        Args:
+            post_id (str): The WordPress post ID to verify
+            
+        Returns:
+            bool: True if the post exists, False otherwise
+        """
+        try:
+            response = requests.get(
+                f"{self.api_base}/posts/{post_id}",
+                headers=self.headers
+            )
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Error verifying post {post_id}: {e}")
+            return False
 
 # Example usage
 if __name__ == "__main__":
