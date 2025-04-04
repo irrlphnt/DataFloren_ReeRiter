@@ -11,6 +11,7 @@ A Python-based article monitoring and rewriting system that processes RSS feeds,
 - **Database Management**: Tracks processed articles and feed status in SQLite database
 - **Tag Management**: Automatically generates and manages article tags
 - **Error Handling**: Robust error handling and logging system
+- **Interactive Setup**: User-friendly setup wizard for configuration
 
 ## Recent Improvements
 
@@ -19,6 +20,7 @@ A Python-based article monitoring and rewriting system that processes RSS feeds,
 - Optimized database operations
 - Improved WordPress post creation with AI metadata
 - Streamlined configuration management
+- Added interactive setup wizard for easy configuration
 
 ## Setup
 
@@ -39,7 +41,18 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Configure the application:
+4. Run the setup wizard:
+```bash
+python main.py --setup
+```
+
+The setup wizard will guide you through:
+- WordPress configuration
+- AI provider selection and setup
+- RSS feed configuration
+- General application settings
+
+Alternatively, you can manually configure the application:
 - Copy `config.example.json` to `config.json`
 - Update the configuration with your WordPress and LMStudio settings
 
@@ -62,14 +75,21 @@ The script will:
 4. Publish to WordPress
 5. Update the database with processed entries
 
+To reconfigure the application at any time, run:
+```bash
+python main.py --setup
+```
+
 ## Configuration
 
-Edit `config.json` to customize:
-- WordPress API settings
-- LMStudio endpoint
-- RSS feed URLs
-- Processing parameters
-- Logging levels
+The application can be configured in two ways:
+1. **Interactive Setup Wizard**: Run `python main.py --setup` for a guided configuration process
+2. **Manual Configuration**: Edit `config.json` to customize:
+   - WordPress API settings
+   - AI provider settings (LMStudio, OpenAI, Anthropic, Ollama)
+   - RSS feed URLs
+   - Processing parameters
+   - Logging levels
 
 ## Project Structure
 
@@ -80,6 +100,7 @@ Edit `config.json` to customize:
 - `rss_monitor.py`: RSS feed monitoring
 - `tag_manager.py`: Tag generation and management
 - `logger.py`: Logging configuration
+- `setup_wizard.py`: Interactive configuration setup
 
 ## Contributing
 
