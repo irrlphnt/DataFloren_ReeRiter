@@ -24,6 +24,7 @@ from lm_studio import LMStudio
 from tag_manager import TagManager
 import requests
 from selenium.webdriver.common.by import By
+from setup_wizard import run_setup  # Add this import at the top
 
 # Load configuration from config.json
 def load_config():
@@ -38,6 +39,9 @@ def load_config():
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Article Monitor & Rewriter')
+    # Add setup flag
+    parser.add_argument('--setup', action='store_true', help='Run the interactive setup wizard')
+    # Existing arguments
     parser.add_argument('--limit', type=int, help='Process only N articles')
     parser.add_argument('--skip-rewrite', action='store_true', help='Skip article rewriting')
     parser.add_argument('--skip-wordpress', action='store_true', help='Skip WordPress posting')
@@ -258,6 +262,21 @@ def get_article_links() -> List[str]:
         finally:
             driver.quit()
 
+def is_article_link(url: str) -> bool:
+    """Check if a URL is likely an article link."""
+    # Skip empty URLs
+    if not url:
+        return False
+        
+    # Skip common non-article paths
+    skip_paths = ['/category/', '/tag/', '/author/', '/page/', '/feed/', '/wp-json/']
+    if any(path in url.lower() for path in skip_paths):
+        return False
+        
+    # Check for common article indicators
+    article_indicators = ['/article/', '/post/', '/news/', '/blog/']
+    return any(indicator in url.lower() for indicator in article_indicators)
+
 def process_links(driver, links, rss_monitor=None):
     """
     Process a list of links, fetching and extracting article data from each link.
@@ -471,9 +490,21 @@ def process_article(entry: Dict[str, Any], lm_studio: Optional[LMStudio] = None)
         return article_data
 
 def main():
+    args = parse_args()
+    
+    # Handle setup wizard
+    if args.setup:
+        run_setup()
+        return
+    
     try:
         # Load configuration
         CONFIG = load_config()
+        
+        # Check if config exists and has required fields
+        if not CONFIG or not all(key in CONFIG for key in ['wordpress', 'monitor']):
+            print("Configuration is missing or incomplete. Please run with --setup flag to configure.")
+            return
         
         # Initialize components
         db = Database()
